@@ -90,9 +90,9 @@ check("搜索框新 placeholder", "搜索客户、公司、产品或询盘" in
       (at.sidebar.text_input(key="inbox_search").placeholder or ""),
       at.sidebar.text_input(key="inbox_search").placeholder or "")
 _opts = at.sidebar.selectbox(key="queue_sort").options
-check("排序下拉含 6 个选项（第六轮）",
-      set(_opts) >= {"AI优先级最高", "待处理优先", "最新询盘", "最久未回复",
-                     "报价准备度", "高商机分"}, str(_opts))
+check("排序下拉含 7 个选项（Phase 3 新增 AI 综合排序）",
+      set(_opts) >= {"AI 综合排序（Queue Score）", "今日待办优先", "待处理优先",
+                     "最新询盘", "最久未回复", "报价准备度", "高商机分"}, str(_opts))
 
 # 卡片结构：状态在客户名之前、#ID、分数右下（HTML 里顺序即可断言层级）
 if _rows:
