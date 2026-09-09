@@ -3179,6 +3179,228 @@ def _render_queue_card(it: dict, sel_id, child: bool = False):
                   help=f"打开 #{it['id']}")
 
 
+# ==================================================================
+# 第十七轮（CRM 对标升级 R1）：全局模块 —— 今日工作台 / 销售管道 / 客户列表
+# 对标 HubSpot（My Day + Contacts）/ Pipedrive（Pipeline 看板）：
+# 纯新增渲染层，只读 load_queue / list_customers 现有口径，
+# 不写库、不改状态机、不动工作区 5 Tab 逻辑（默认模块 = 工作区）。
+# ==================================================================
+_CRM_HOME = "💼 工作区"
+_CRM_TODAY = "🏠 今日"
+_CRM_PIPE = "📊 管道"
+_CRM_CUST = "👥 客户"
+
+
+def _open_from_module(iid: int):
+    """从 CRM 模块打开询盘：复用 _open_inquiry 的状态切换，并切回工作区模块。"""
+    _open_inquiry(iid)
+    st.session_state.crm_module = _CRM_HOME
+
+
+def _crm_module_nav():
+    """主区顶部的全局模块导航；默认=工作区，老功能原样渲染。"""
+    return st.pills(
+        "模块", [_CRM_HOME, _CRM_TODAY, _CRM_PIPE, _CRM_CUST],
+        key="crm_module", default=_CRM_HOME, label_visibility="collapsed")
+
+
+def _crm_items():
+    """CRM 模块共用询盘口径（与侧栏队列同源同排序；失败兜底为空列表）。"""
+    try:
+        return load_queue(None)
+    except Exception:
+        return []
+
+
+def _crm_week_new(items):
+    """本周新增询盘（近 7 天，按 created_at 日期粗分）。"""
+    _cut = (datetime.datetime.now() - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+    return [x for x in items if str(x.get("created") or "")[:10] >= _cut]
+
+
+def _crm_open_row(x: dict, key: str):
+    """模块页的一行询盘：信息 + [打开] 按钮（点击后切回工作区并选中该询盘）。"""
+    import html as _eh
+    act = x.get("action") or {}
+    biz_cn = _wf.BIZ_CN.get(x.get("biz"), x.get("biz") or "—")
+    fu = x.get("fu_state") or ""
+    who = _eh.escape(str(x["company"] or x["contact"] or "未署名客户"))
+    nxt = (f" · 下一步：<b>{_eh.escape(str(act['label']))}</b>"
+           if act.get("label") else "")
+    aip = x.get("aip3")
+    aip_txt = str(aip) if aip is not None else "—"
+    c1, c2 = st.columns([7, 1])
+    with c1:
+        st.markdown(
+            f"**{who}** · {_flag(x['country'])} {x['country'] or '未知'}"
+            f" · {biz_cn}"
+            + (f" · 跟进：<b style='color:var(--danger)'>{fu}</b>" if fu == "已逾期"
+               else (f" · 跟进：{fu}" if fu else ""))
+            + nxt)
+        st.caption(f"#{x['id']} · {str(x['created'])[:16]}"
+                   f" · AI Priority {aip_txt}"
+                   + (f" · {str(x.get('need', {}).get('product') or '')[:40]}"
+                      if x.get("need", {}).get("product") else ""))
+    with c2:
+        st.button("打开", key=key, use_container_width=True,
+                  on_click=_open_from_module, args=(x["id"],))
+
+
+def _render_today_page():
+    """🏠 今日工作台（对标 HubSpot My Day）：逾期 → 今日 → 待回复 → 本周新增。"""
+    st.subheader("🏠 今日工作台（My Day）")
+    st.caption("今天该做什么，按顺序来：逾期跟进 → 今日跟进 → 待回复 → 本周新增。"
+               "口径与侧栏队列完全一致。")
+    items = _crm_items()
+    todo = [x for x in items if x["status"] == STATUS_TODO]
+    overdue = [x for x in items if x.get("fu_state") == "已逾期"]
+    today_fu = [x for x in items if x.get("fu_state") == "今日跟进"]
+    n_reply = sum(1 for x in todo if x.get("biz") == _wf.READY_TO_REPLY)
+    week = _crm_week_new(items)
+    k1, k2, k3, k4 = st.columns(4)
+    _kpi_card(k1, "已逾期跟进", len(overdue), "最优先处理，别让客户凉掉", "red")
+    _kpi_card(k2, "今日跟进", len(today_fu), "今天要触达的客户", "amber")
+    _kpi_card(k3, "待回复", n_reply, "具备回复条件的询盘", "blue")
+    _kpi_card(k4, "本周新增询盘", len(week), "近 7 天新线索", "green")
+    st.divider()
+
+    if overdue:
+        st.markdown("**⏰ 逾期跟进（先做这些）**")
+        for x in overdue:
+            _crm_open_row(x, f"crm_od_{x['id']}")
+    else:
+        st.markdown("✅ **没有逾期跟进**")
+    if today_fu:
+        st.markdown("**📌 今日跟进**")
+        for x in today_fu:
+            _crm_open_row(x, f"crm_td_{x['id']}")
+    st.divider()
+    st.markdown("**💬 待回复 Top 5（按 Queue Score）**")
+    top = sorted([x for x in todo if x.get("biz") == _wf.READY_TO_REPLY],
+                 key=lambda x: -(x.get("qs3") or x.get("score") or 0))[:5]
+    for x in top:
+        _crm_open_row(x, f"crm_rp_{x['id']}")
+    if not top:
+        st.caption("暂无待回复询盘。")
+    if week:
+        st.markdown("**🆕 本周新增询盘（最新 5 条）**")
+        for x in sorted(week, key=lambda x: str(x.get("created") or ""),
+                        reverse=True)[:5]:
+            _crm_open_row(x, f"crm_nw_{x['id']}")
+
+
+# 管道看板展示的商机阶段（crm.py 九态，与客户工作区商机状态条同一口径）；
+# 左→右 = 推进顺序。WON / LOST / NURTURE 为终态，收进折叠区
+_PIPE_OPP = [_crm.OPP_NEW, _crm.OPP_QUALIFYING, _crm.OPP_MATCHING,
+             _crm.OPP_QUOTE_PENDING, _crm.OPP_QUOTED, _crm.OPP_NEGOTIATING]
+
+
+def _render_pipeline_page():
+    """📊 销售管道（对标 Pipedrive Pipeline）：按商机阶段的只读看板。
+
+    阶段口径 = crm.py 商机九态（opp_stage_of_biz），与详情页 7 段状态条
+    完全一致——一个阶段只有一个名字，不发明新词。
+    """
+    import html as _eh
+    st.subheader("📊 销售管道（Pipeline）")
+    st.caption("全部询盘按商机阶段分布，左→右 = 推进顺序。点击卡片回到工作区处理。")
+    items = _crm_items()
+    groups = {b: [] for b in _PIPE_OPP}
+    finals = []
+    for x in items:
+        groups.get(_crm.opp_stage_of_biz(x.get("biz")), finals).append(x)
+
+    def _pipe_col(col, b):
+        g = groups[b]
+        emoji = _crm.OPP_EMOJI.get(b, "")
+        with col:
+            st.markdown(f"**{emoji} {_crm.OPP_CN.get(b, b)}**　`{len(g)}`")
+            st.divider()
+            for x in sorted(g, key=lambda x: -(x.get("qs3") or 0))[:8]:
+                who = _eh.escape(str(x["company"] or x["contact"] or "未署名"))
+                st.markdown(
+                    f"<div style='font-size:.78rem;line-height:1.55'>"
+                    f"<b>{who}</b><br>"
+                    f"{_flag(x['country'])} {x['country'] or '未知'} · #{x['id']}"
+                    f" · AIP {x.get('aip3') if x.get('aip3') is not None else '—'}"
+                    f"</div>",
+                    unsafe_allow_html=True)
+                st.button("打开", key=f"pipe_{b}_{x['id']}",
+                          use_container_width=True,
+                          on_click=_open_from_module, args=(x["id"],))
+            if len(g) > 8:
+                st.caption(f"…另有 {len(g) - 8} 条")
+
+    half = (len(_PIPE_OPP) + 1) // 2
+    st.markdown("##### 前期阶段")
+    cols_top = st.columns(half)
+    for col, b in zip(cols_top, _PIPE_OPP[:half]):
+        _pipe_col(col, b)
+    st.markdown("##### 推进阶段")
+    cols_bot = st.columns(len(_PIPE_OPP) - half)
+    for col, b in zip(cols_bot, _PIPE_OPP[half:]):
+        _pipe_col(col, b)
+    if finals:
+        with st.expander(f"终态（已成交 / 已丢单 / 长期培育，共 {len(finals)} 条）"):
+            for x in sorted(finals, key=lambda x: str(x.get("created") or ""),
+                            reverse=True):
+                st.caption(f"#{x['id']} · {x['company'] or '未署名'}"
+                           f" · {_crm.OPP_CN.get(_crm.opp_stage_of_biz(x.get('biz')), '—')}"
+                           f" · {str(x.get('created') or '')[:10]}")
+
+
+def _render_contacts_page():
+    """👥 客户列表（对标 HubSpot Contacts）：全量客户档案 + 搜索 + 打开。"""
+    st.subheader("👥 客户（Contacts）")
+    st.caption("全部客户档案。点「打开」进入该客户名下最新询盘的工作区"
+               "（Header / Pipeline / AI Assistant / Timeline）。")
+    _q = (st.text_input("搜索", key="crm_cust_search",
+                        label_visibility="collapsed",
+                        placeholder="🔍 公司 / 国家 / 邮箱 / 联系人")
+          or "").strip().lower()
+    items = _crm_items()
+    # 每个客户名下最新一条询盘（用于「打开」跳转）
+    latest = {}
+    for x in items:
+        cid = x.get("cust_id")
+        if cid is not None and (cid not in latest
+                                or str(x.get("created") or "")
+                                > str(latest[cid].get("created") or "")):
+            latest[cid] = x
+    try:
+        rows = list_customers()
+    except Exception:
+        rows = []
+    if _q:
+        rows = [r for r in rows
+                if _q in " ".join(str(v) for v in r[:5]).lower()]
+    if not rows:
+        st.caption("暂无客户档案，先在工作区完成一次询盘分析。")
+        return
+    for r in rows:
+        cid, company, country, email, contact, cnt, last_grade, score, seen, \
+            grade, note = r[:11]
+        g = grade or last_grade or "—"
+        c1, c2 = st.columns([9, 1])
+        with c1:
+            st.markdown(
+                f"{GRADE_COLOR.get(g, '')} **{company or '（未署名）'}**"
+                f" · {_flag(country)} {country or ''} · {email or ''}"
+                + (f" · {contact}" if contact else ""))
+            st.caption(f"等级 {g} · 询盘 {cnt} 条"
+                       f" · 最近互动 {str(seen)[:10] or '—'}"
+                       + (f" · {note[:30]}" if note else ""))
+        with c2:
+            if cid in latest:
+                st.button("打开", key=f"crm_cust_{cid}",
+                          use_container_width=True,
+                          on_click=_open_from_module,
+                          args=(latest[cid]["id"],))
+            else:
+                st.button("打开", key=f"crm_cust_{cid}",
+                          use_container_width=True, disabled=True)
+
+
 # 侧边栏：销售工作队列（Sales Work Queue —— “我现在该处理什么”）
 with st.sidebar:
     st.markdown("#### 询盘队列")
@@ -3450,6 +3672,20 @@ with st.sidebar:
                 if _opened:
                     for _git in _gitems:
                         _render_queue_card(_git, _cur_sel, child=True)
+
+# —— 第十七轮（CRM 对标升级 R1）：全局模块导航 ——
+# 默认选中「工作区」→ 原有 5 Tab 主区原样渲染；
+# 选其他模块 → 渲染对应 CRM 页面后 st.stop()，5 Tab 区不执行（零回归）。
+_mod = _crm_module_nav()
+if _mod == _CRM_TODAY:
+    _render_today_page()
+    st.stop()
+if _mod == _CRM_PIPE:
+    _render_pipeline_page()
+    st.stop()
+if _mod == _CRM_CUST:
+    _render_contacts_page()
+    st.stop()
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
     ["分析询盘", "跟进台", "客户档案", "产品库", "导出"])
