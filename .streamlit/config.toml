@@ -1,0 +1,9 @@
+# V8.1 Visual System · 主题 Token（与 app.py :root 设计变量一致）
+# 仅视觉：pills/tabs/radio 等内建控件的 accent 色由主题变量驱动，
+# CSS 无法覆盖（Streamlit 以内联 style 注入），必须在此统一定义。
+[theme]
+base = "light"
+primaryColor = "#2563EB"
+backgroundColor = "#F5F7FA"
+secondaryBackgroundColor = "#F1F4F8"
+textColor = "#172033"

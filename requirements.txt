@@ -1,0 +1,5 @@
+# AI 外贸销售工作台 · 依赖清单
+# 说明：AI 引擎（agent/）只用 Python 标准库（urllib 调 DeepSeek），
+#       唯一第三方依赖是界面框架 Streamlit。
+# Python 版本建议：3.12 或 3.13
+streamlit>=1.40

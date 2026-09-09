@@ -1,0 +1,68 @@
+[
+  {
+    "id": "P001",
+    "name": "Neoprene Swim Cap",
+    "name_cn": "氯丁橡胶泳帽",
+    "keywords": ["swim cap", "swimming cap", "neoprene cap", "neoprnee", "neoprene"],
+    "moq": 1000,
+    "price_range": [0.85, 1.60],
+    "unit": "USD/pc (FOB Ningbo)",
+    "lead_time": "25-30 days",
+    "hs_code": "6506910000"
+  },
+  {
+    "id": "P002",
+    "name": "Silicone Swim Cap",
+    "name_cn": "硅胶泳帽",
+    "keywords": ["silicone cap", "silicone swim cap", "silicone swimming cap"],
+    "moq": 2000,
+    "price_range": [0.30, 0.65],
+    "unit": "USD/pc (FOB Ningbo)",
+    "lead_time": "20-25 days",
+    "hs_code": "6506910000"
+  },
+  {
+    "id": "P003",
+    "name": "Swim Goggles",
+    "name_cn": "游泳镜",
+    "keywords": ["goggles", "swim goggles", "swimming goggles", "goggle"],
+    "moq": 500,
+    "price_range": [1.20, 3.80],
+    "unit": "USD/pc (FOB Ningbo)",
+    "lead_time": "30-35 days",
+    "hs_code": "9004909000"
+  },
+  {
+    "id": "P004",
+    "name": "Neoprene Wetsuit",
+    "name_cn": "氯丁橡胶潜水服",
+    "keywords": ["wetsuit", "wet suit", "diving suit", "neoprene suit"],
+    "moq": 200,
+    "price_range": [18.00, 55.00],
+    "unit": "USD/pc (FOB Ningbo)",
+    "lead_time": "35-45 days",
+    "hs_code": "6113000090"
+  },
+  {
+    "id": "P005",
+    "name": "Swimming Ear Plug & Nose Clip Set",
+    "name_cn": "耳塞鼻夹套装",
+    "keywords": ["ear plug", "nose clip", "earplug", "noseclip"],
+    "moq": 3000,
+    "price_range": [0.18, 0.45],
+    "unit": "USD/set (FOB Ningbo)",
+    "lead_time": "18-22 days",
+    "hs_code": "9506910000"
+  },
+  {
+    "id": "P006",
+    "name": "Microfiber Swim Towel",
+    "name_cn": "超细纤维速干浴巾",
+    "keywords": ["swim towel", "microfiber towel", "quick dry towel", "towel"],
+    "moq": 1000,
+    "price_range": [0.90, 2.50],
+    "unit": "USD/pc (FOB Ningbo)",
+    "lead_time": "22-28 days",
+    "hs_code": "6302601090"
+  }
+]
