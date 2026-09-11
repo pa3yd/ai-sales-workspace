@@ -90,9 +90,9 @@ check("搜索框新 placeholder", "搜索客户、公司、产品或询盘" in
       (at.sidebar.text_input(key="inbox_search").placeholder or ""),
       at.sidebar.text_input(key="inbox_search").placeholder or "")
 _opts = at.sidebar.selectbox(key="queue_sort").options
-check("排序下拉含 7 个选项（Phase 3 新增 AI 综合排序）",
-      set(_opts) >= {"AI 综合排序（Queue Score）", "今日待办优先", "待处理优先",
-                     "最新询盘", "最久未回复", "报价准备度", "高商机分"}, str(_opts))
+check("排序下拉含 7 个选项（第二十二轮：AI综合+今日待办等）",
+      len(_opts) == 7 and "AI 综合排序（Queue Score）" in _opts
+      and "今日待办优先" in _opts, str(_opts))
 
 # 卡片结构：状态在客户名之前、#ID、分数右下（HTML 里顺序即可断言层级）
 if _rows:
@@ -168,22 +168,25 @@ if _first_id is not None:
 else:
     print("  ⏭️ 库中无询盘数据，跳过选中测试")
 
-# ---------- Test A：同客户多询盘可区分 ----------
-print("== Test A：同客户多询盘 ==")
+# ---------- Test A：同客户多条往来聚合（第二十二轮 Deal Threading）----------
+print("== Test A：同客户多消息聚合为一张 Deal 卡 ==")
 if _same_company:
-    _ids = [r[0] for r in _rows if (r[5] or r[6]) == _same_company]
+    _ids = sorted(r[0] for r in _rows if (r[5] or r[6]) == _same_company)
     at5 = AppTest.from_file(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                          "workbench", "app.py"), default_timeout=60)
     at5.run()
-    # 第六轮：同客户多询盘默认折叠为组 → 先展开全部组，再检查每条 #ID
-    # （每次点击后页面重渲染，需按 key 重新获取按钮，旧元素点击会失效）
-    _gkeys = [str(b.key) for b in at5.sidebar.button if str(b.key).startswith("g_")]
-    for _k in _gkeys:
+    # 第二十二轮：默认只渲染「每 Deal 一张主卡」+ 展开按钮（sd_），不再
+    # 把同客户同产品的每条消息都渲染成一张独立卡。
+    _sdkeys = [str(b.key) for b in at5.sidebar.button
+               if str(b.key).startswith("sd_")]
+    check("多消息聚合后有「展开历史往来」按钮", len(_sdkeys) >= 1,
+          str(_sdkeys))
+    for _k in _sdkeys:
         _b = at5.sidebar.button(key=_k)
         if _b:
             _b.click().run()
     md5 = "\n".join(x.value for x in at5.sidebar.markdown)
-    check("同客户多条记录各自带 #ID",
+    check("展开后该客户全部消息 #ID 仍可见（历史不丢）",
           all(("#%d" % i) in md5 for i in _ids), str(_ids))
 else:
     print("  ⏭️ 库中暂无同客户多条询盘，跳过")

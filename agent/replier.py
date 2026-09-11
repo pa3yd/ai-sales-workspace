@@ -68,6 +68,12 @@ FIRST-ROUND STRATEGY (ROUND 5 - ABSOLUTE, overrides everything else):
   ("Is approximately 3,000 pcs your expected initial order quantity?") - never ask
   "How many pieces do you need?".
 - Never invent time commitments ("within 24 hours", "by Friday") - no SLA data exists.
+- If the buyer requested a fast reply / deadline (e.g. "within 24 hours"), acknowledge the
+  requested timeframe WITHOUT guaranteeing it: "We have noted your requested timeframe and
+  will prioritize the quotation accordingly." Never write "we will send ... within 24 hours".
+- MINIMUM QUESTION STRATEGY (TEST02): UNKNOWN does NOT mean ask. Classify the field by the
+  current sales stage; ask only the questions marked ASK_NOW that block the very next step.
+  ASK_LATER / DO_NOT_ASK topics must never appear in this email.
 - If the buyer asked for a catalog, answer that request BEFORE any question.
 
 QUOTE READINESS RULE:
@@ -103,9 +109,10 @@ explicitly supports it: free samples, free molds/tooling, free design/artwork,
 free certification, fixed price, MOQ, fixed lead time, stock availability,
 production capacity, existing certification, payment terms, warranty policy,
 shipping/transit time.
-- Customer says "We need samples." -> write "We can arrange samples for
-  evaluation and will confirm the sample cost and courier arrangement."
-  NEVER "We can provide free samples."
+- Customer says "We need samples." -> do NOT claim samples can be arranged/shipped or
+  are free (no verified sample policy). Write: "We will confirm sample availability,
+  sample cost and shipping together with the quotation."
+  NEVER "We can provide free samples." / "We can arrange samples."
 - If a commitment cannot be verified, write a checking sentence instead:
   "Let me confirm this with our team and get back to you."
 
@@ -535,10 +542,12 @@ class ReplyGenerator:
                          "which certification is mandatory")
 
         if re.search(r"\bsample[s]?\b", low):
-            # Fact Guard：样品是否免费/费用与寄送安排由公司政策决定，禁止自动承诺
-            offer.append("buyer asked about samples: say we can arrange samples for "
-                         "evaluation and will confirm the sample cost and courier "
-                         "arrangement - NEVER claim samples are free")
+            # Round 2 TEST01（Fact Guard）：无公司样品政策数据时，禁止"已可安排/寄出"类承诺，
+            # 只能承诺"随报价一起确认样品可得性、费用与物流"。
+            offer.append("buyer asked about samples: say sample availability, sample cost "
+                         "and the shipping arrangement will be confirmed together with the "
+                         "quotation - NEVER claim samples are free, available, or that we "
+                         "can arrange/send them")
         if re.search(r"\b(catalog|catalogue|price\s+list)\b", low):
             # 第五轮第三次优化：意图为 Catalog/Sample 请求时，必须先响应请求本身，
             # 不得要求客户先给型号/图片/数量
@@ -620,16 +629,15 @@ class ReplyGenerator:
 
         blocks = []
 
-        # 1) 开场：感谢 + 一句公司身份（不吹嘘、不编资质；身份词来自 Company Data）
-        if company_type:
-            blocks.append(
-                f"Thank you for your inquiry. We are a {company_type} based in "
-                f"{seller.get('city', 'China')}"
-                f"{', and this item is within our main range' if product else ''}.")
+        # 1) 开场：感谢 +（可选）一句公司身份（不吹嘘、不编资质；身份词来自 Company Data）
+        # TEST03：删除 "This is us / This is our team" 这类空泛占位开场——不表达任何信息，
+        #   也避免重复。有确认产品则点题产品，没有则只致谢。
+        if product:
+            blocks.append(f"Thank you for your inquiry about {product['name']}.")
         else:
-            blocks.append(
-                f"Thank you for your inquiry. This is {seller.get('company', 'us')}"
-                f"{', and the item you described is of interest to us' if product else ''}.")
+            blocks.append("Thank you for your inquiry.")
+        if company_type:
+            blocks.append(f"We are a {company_type} based in {seller.get('city', 'China')}.")
 
         # 2) 优先回应客户明确提出的需求（Catalog / 样品 / 认证 / 报价）
         if "catalog" in requests:
@@ -637,10 +645,10 @@ class ReplyGenerator:
             blocks.append("We would be happy to share our latest catalog and product "
                           "information with you.")
         if "samples" in requests:
-            # 第五轮补丁 02：不得默认承诺 we will send samples
-            blocks.append("Once the relevant product is selected, our team can advise "
-                          "on sample availability and the quickest way to send them to "
-                          "you.")
+            # Round 2 TEST01：样品承诺必须有公司/产品数据支撑。
+            # 无样品政策数据时只承诺"随报价一起确认"，绝不自动承诺已可安排/寄出。
+            blocks.append("Sample availability, sample cost and the shipping arrangement "
+                          "will be confirmed together with the quotation.")
         if "certifications" in requests:
             # 公司事实防幻觉 + Fact Guard：认证清单必须来自 Company Data（config.json
             # SELLER.certifications）；有配置 → 如实列出（COMPANY_FACT）；
@@ -721,11 +729,24 @@ class ReplyGenerator:
                               "check whether we can supply an equivalent or "
                               "recommend the closest option for you.")
             else:
-                blocks.append("Our current catalog focuses on swim gear (caps, "
-                              "goggles, towels, etc.) so we do not have a direct "
-                              "match for the item you described. Sharing a "
-                              "reference model, a photo or a link will help us "
-                              "check the closest option for you.")
+                # Round 2 TEST01 / TEST03：库内暂无对应 SKU → acknowledge + 内部核实，
+                # 绝不把"我方供应缺口"当成"客户没说清产品"退回给客户。
+                # 参考型号/图片/设计的确切提问由 plan.selected 承担，这里不重复问。
+                _cust_phrase = (info.get("product_query") or "").strip()
+                if _cust_phrase:
+                    blocks.append(
+                        f"We have reviewed your request{f' for {qty_str}' if qty else ''} "
+                        f"and noted your specification for {_cust_phrase}. "
+                        "This category is not currently represented in our standard catalog, "
+                        "so we are checking internally whether we can support this project "
+                        "or arrange a suitable supply option. We will come back to you as "
+                        "soon as we have confirmed this internally.")
+                else:
+                    blocks.append(f"We have reviewed your request"
+                                  f"{f' for {qty_str}' if qty else ''}"
+                                  " and are checking the closest available configuration "
+                                  "against your target price. We will come back to you with "
+                                  "the applicable details once the configuration is confirmed.")
         elif match_state == MATCH_INSUFFICIENT:
             # 第五轮补丁 02：连 Product Category / Product Type 都没有
             # → 块里只确认"我们需要先知道产品类别"，不要求 reference model
@@ -754,8 +775,27 @@ class ReplyGenerator:
                               "price.")
 
         # 4) 只问 P0（计划已限流：默认 1-2 个，绝对不超过 3 个）
+        #    TEST03：追加前查重——同一澄清问题绝不在同一封邮件中出现两次
+        #    （LLM/模板都可能在"回应段"与"问题段"重复同一问句）。
+        def _normq(s: str) -> str:
+            return re.sub(r"[^a-z0-9 ]", "", (s or "").lower()).strip()
+        _sent_asks = " ".join(_normq(b) for b in blocks)
         for q in plan.get("selected") or []:
+            _q = _normq(q["question"])
+            if _q and _q in _sent_asks:
+                continue
             blocks.append(q["question"])
+            _sent_asks += " " + _q
+
+        # 4.5) Round 2 TEST02 §11：客户要求"24 小时内报价/回复" →
+        #      只复述已收到其时限并承诺优先处理，绝不创造无 SLA 的时间承诺
+        #      （"we will send ... within 24 hours" 必须由 COMPANY_FACT / SLA 支撑）
+        _req_tm = re.search(
+            r"(?:send|reply|respond|quote|quotation|offer|proposal|get\s+back|answer)"
+            r"[^.!?]{0,60}?\bwithin\s+(\d+\s*(?:hour|hr|day)s?)\b", low, re.I)
+        if _req_tm:
+            blocks.append("We have noted your requested timeframe and will prioritize "
+                          "the quotation accordingly.")
 
         # 5) 下一步动作承诺（条件式，不承诺没有依据的时间）
         if plan.get("selected"):

@@ -3,3 +3,5 @@
 #       唯一第三方依赖是界面框架 Streamlit。
 # Python 版本建议：3.12 或 3.13
 streamlit>=1.40
+openpyxl>=3.1
+streamlit-sortables>=0.3.0

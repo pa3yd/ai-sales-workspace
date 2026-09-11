@@ -458,7 +458,7 @@ def next_best_action(item: dict, act: dict = None, fu_state: str = "",
         action_type = action_type or "FOLLOW_UP"
         reason = "已回复/已跟进，等待客户反馈；期间无需主动打扰"
     else:
-        reason = "按当前销售阶段推进即可"
+        reason = "客户需求已有可执行线索，下一步应推进当前销售动作。"
 
     return {"current_stage": stage_cn or status_cn, "current_status": status_cn,
             "action_label": action_label, "action_type": action_type or "",

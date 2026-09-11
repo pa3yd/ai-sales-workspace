@@ -409,6 +409,19 @@ def build_fact_layer(text: str, info: dict, matches: list,
                       "value": None, "display": "未提及",
                       "source": SRC_UNKNOWN, "certainty": CERT_UNKNOWN,
                       "note": ""})
+    # 2.1) 竞争对手报价（TEST03 商业情报）——只保留上下文供销售参考，
+    #      绝不等于我方报价/客户目标价，默认不进邮件正文（无政策依据不对外引用）
+    _cp = info.get("competitor_price")
+    if _cp:
+        _cp_cert = CERT_APPROXIMATE if info.get("competitor_price_approx") else CERT_CONFIRMED
+        _cp_cur = info.get("competitor_price_currency") or "USD"
+        facts.append({
+            "field": "competitor_price", "label": "竞争对手报价",
+            "value": f"{_cp_cur} {_cp}",
+            "display": f"{'约 ' if _cp_cert == CERT_APPROXIMATE else ''}{_cp_cur} {_cp} / pc（客户转述的同行报价）",
+            "source": SRC_CUSTOMER, "certainty": _cp_cert,
+            "note": "竞争对手报价 ≠ 我方报价；无公司价格政策依据时，邮件不得引用或承诺低于该价格",
+        })
     # 公司报价（永远单独一行，未提供就写未提供）
     _top_prod = _confirmed_product(matches)
     if _top_prod and _top_prod.get("price_range"):

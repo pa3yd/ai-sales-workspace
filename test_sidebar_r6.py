@@ -165,18 +165,15 @@ if _cands:
           f"first={(_ss(at.session_state, 'queue_ids') or [None])[0]} "
           f"expect=(QS{_cands[0][1]}, #{_cands[0][0]})")
 
-# ---- Test A：同客户聚合 ----
-print("== Test A：客户聚合 ==")
+# ---- Test A：同客户多条消息 → Deal 聚合（第二十二轮 Deal Threading）----
+print("== Test A：客户 Deal 聚合 ==")
 if _dup_company:
-    check("聚合组头显示「N 个询盘 · M 个待回复」",
-          "个询盘 ·" in _sb_md, _sb_md[:200])
-    # 搜索该客户 → 组内展开后每条 #ID 都在。
-    # 组按钮的先后随默认排序变化（Phase 3 = Queue Score），
-    # 这里遍历点击直到展开的组包含目标询盘，不依赖组顺序。
+    check("统计口径含「按 Deal 聚合」（条 / 个 分开，第 14 节）",
+          "按 Deal 聚合" in _sb_md and "条询盘" in _sb_md, _sb_md[:200])
+    # 搜索该客户 → 每 Deal 一张主卡；展开历史后每条 #ID 都在。
     at2 = AppTest.from_file(APP, default_timeout=90)
     at2.run()
     at2.sidebar.text_input(key="inbox_search").set_value(_dup_company).run()
-    _g_btn = [b for b in at2.sidebar.button if str(b.key).startswith("g_")]
     _dup_ids = sorted(r[0] for r in _rows if (r[5] or r[6]) == _dup_company)
 
     def _side_md():
@@ -185,23 +182,18 @@ if _dup_company:
     def _contains_all():
         return all(("#%d" % i) in _side_md() for i in _dup_ids)
 
-    _found = False
-    for _gb in _g_btn:
-        _gb.click().run()
-        if _contains_all():
-            _found = True
-            break
-        # 未命中 → 收起该组再试下一个
-        _same = [b for b in at2.sidebar.button if b.key == _gb.key]
-        if _same:
-            _same[0].click().run()
-    if _g_btn:
-        check("展开后组内每条询盘 #ID 可见",
-              _found and _contains_all(), str(_dup_ids))
-        check("收起提示切换为「点击收起」", "点击收起" in _side_md(),
-              _side_md()[:150])
-    else:
-        check("聚合组展开按钮存在", False, "no g_ button")
+    # 展开该客户的全部 Deal 历史（每次点击后页面重渲染，需按 key 重新取按钮）
+    _sdkeys = [str(b.key) for b in at2.sidebar.button
+               if str(b.key).startswith("sd_")]
+    for _k in _sdkeys:
+        _b = at2.sidebar.button(key=_k)
+        if _b:
+            _b.click().run()
+    check("展开后该客户全部消息 #ID 可见（历史完整保留）",
+          bool(_sdkeys) and _contains_all(), str(_dup_ids))
+    check("展开态按钮为「收起历史」",
+          any("收起历史" in str(b.label) for b in at2.sidebar.button),
+          _side_md()[:150])
 else:
     print("  ⏭️ 库中暂无同客户多条询盘，跳过聚合 UI 断言（单元已覆盖）")
 
@@ -212,12 +204,12 @@ if _rows:
     at3.run()
     todo_ids = {r[0] for r in _rows if r[7] == STATUS_TODO}
     done_ids = {r[0] for r in _rows if r[7] == STATUS_DONE}
-    at3.segmented_control(key="queue_filter").set_value("待回复").run()
+    at3.segmented_control(key="sales_inbox_filter").set_value("待回复").run()
     got3 = at.session_state and _ss(at3.session_state, "queue_ids") or []
     check("筛选待回复 → 只剩待处理询盘", set(got3) <= todo_ids and got3,
           f"{got3[:6]} todo={len(todo_ids)}")
     if done_ids:
-        at3.segmented_control(key="queue_filter").set_value("待跟进").run()
+        at3.segmented_control(key="sales_inbox_filter").set_value("待跟进").run()
         got3b = _ss(at3.session_state, "queue_ids") or []
         check("筛选待跟进 → 只剩已处理(待跟进阶段)询盘", set(got3b) <= done_ids and got3b, str(got3b[:6]))
 
@@ -225,7 +217,7 @@ if _rows:
     if done_ids:
         at3.session_state["selected_id"] = sorted(done_ids)[0]
         at3.session_state["analyzed"] = None
-        at3.segmented_control(key="queue_filter").set_value("待回复").run()
+        at3.segmented_control(key="sales_inbox_filter").set_value("待回复").run()
         _new_sel = _ss(at3.session_state, "selected_id")
         _vis = _ss(at3.session_state, "queue_ids") or []
         check("选中不在筛选结果 → 自动选中第一条",
@@ -308,17 +300,9 @@ if len(_rows) >= 2:
     else:
         check("主工作区存在「下一个 →」按钮（hero_next）", False, "")
 
-# ---- KPI 点击联动（spec 二十一）----
-print("== KPI 联动 ==")
-at8 = AppTest.from_file(APP, default_timeout=90)
-at8.run()
-_kbtns = [b for b in at8.button if str(b.key).startswith("kpi_nav_")]
-check("4 个 KPI 覆盖按钮存在", len(_kbtns) == 4, str([b.key for b in _kbtns]))
-if _kbtns:
-    _kbtns[1].click().run()   # 待回复 KPI
-    check("点击待回复 KPI → 筛选联动",
-          _ss(at8.session_state, "queue_filter") == "待回复",
-          str(_ss(at8.session_state, "queue_filter")))
+# ---- KPI 联动（spec 二十一）----
+# 第 19 轮起首页 KPI 改为只读概览卡（今日概览 / 今日优先），
+# 「点 KPI → 自动筛选」入口已由「AI 今日建议」取代，旧断言不再适用。
 
 print()
 print(f"结果：{_PASS} 通过 / {_FAIL} 失败")

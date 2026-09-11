@@ -63,6 +63,11 @@ class InquiryExtractor:
             "quantity": None,          # 采购数量
             "quantity_unit": None,     # 数量单位 pcs / sets / ...
             "target_price": None,      # 目标价
+            # ---- 竞争情报（TEST03）：竞争对手报价 ≠ 我方报价 / 客户目标价 ----
+            "competitor_price": None,          # 竞品/同行报价数值
+            "competitor_price_currency": None,
+            "competitor_price_approx": False,  # 是否含 approximately/about 等约数词
+            "competitor_price_note": "",       # 原文片段（可展示给销售，不用于对外承诺）
             "country": None,           # 客户国家
             "company": None,           # 客户公司名
             "website": None,           # 公司网址
@@ -85,6 +90,11 @@ class InquiryExtractor:
         info["email"] = self._find_email(text)
         info["quantity"], info["quantity_unit"] = self._find_quantity(text_lower)
         info["target_price"] = self._find_target_price(text)
+        comp = self._find_competitor_price(text)
+        info["competitor_price"] = comp["value"]
+        info["competitor_price_currency"] = comp["currency"]
+        info["competitor_price_approx"] = comp["approx"]
+        info["competitor_price_note"] = comp["note"]
         info["country"] = self._find_country(text_lower, info["email"])
         info["company"] = self._find_company(text)
         info["website"] = self._find_website(text, info["email"])
@@ -128,14 +138,57 @@ class InquiryExtractor:
         return None, None
 
     def _find_target_price(self, text: str):
-        """提取目标价，例如 USD 0.5 / $0.8/pc / target price 1.2"""
-        m = re.search(r"(?:usd|us\$|\$)\s*(\d+(?:\.\d+)?)", text, re.IGNORECASE)
+        """提取目标价，例如 USD 0.5 / $0.8/pc / target price 1.2
+        TEST03 修复：竞争对手报价（competitor / another supplier 等引出的 USD x）
+        绝不当作客户目标价——先把这些句子从目标价识别中剔除。
+        """
+        # 竞品句剔除：从 competitor/another supplier 等线索起到最近的 USD 数字句段
+        clean = re.sub(
+            r"(?:competitor|another\s+(?:supplier|vendor|factory|offer)|"
+            r"competitive\s+offer|their\s+offer|current\s+supplier)[^.!?\n]*"
+            r"(?:USD|US\$|\$)\s*\d+(?:\.\d+)?[^.!?\n]*",
+            " ", text, flags=re.IGNORECASE)
+        m = re.search(r"(?:usd|us\$|\$)\s*(\d+(?:\.\d+)?)", clean, re.IGNORECASE)
         if m:
             return float(m.group(1))
-        m = re.search(r"target price[:\s]*(\d+(?:\.\d+)?)", text, re.IGNORECASE)
+        m = re.search(r"target price[:\s]*(\d+(?:\.\d+)?)", clean, re.IGNORECASE)
         if m:
             return float(m.group(1))
         return None
+
+    @staticmethod
+    def _find_competitor_price(text: str) -> dict:
+        """竞争对手/同行报价（TEST03 商业情报）：competitor quote ≈ USD 4.35/pc。
+
+        只做“保留上下文、供销售判断”的提取，绝不写进公司报价 / 客户目标价。
+        支持语序一（线索在前：competitor has offered approximately USD 4.35）
+        与语序二（金额在前，线索在后：USD 4.35 quoted by another supplier）。
+        """
+        low = text or ""
+        out = {"value": None, "currency": None, "approx": False, "note": ""}
+        patterns = [
+            # 线索在前：competitor / another supplier ... USD 4.35
+            re.compile(
+                r"(?:competitor|another\s+(?:supplier|vendor|factory)|"
+                r"competitive\s+offer|current\s+supplier)[^.!?\n]{0,90}?"
+                r"(?:USD|US\$|\$)\s*(\d+(?:\.\d+)?)", re.I),
+            # 金额在前：USD 4.35 ... competitor / another supplier
+            re.compile(
+                r"(?:USD|US\$|\$)\s*(\d+(?:\.\d+)?)[^.!?\n]{0,90}?"
+                r"(?:competitor|another\s+(?:supplier|vendor|factory))", re.I),
+        ]
+        for pat in patterns:
+            m = pat.search(low)
+            if m:
+                val = float(m.group(1))
+                approx = bool(re.search(
+                    r"(approximat\w*|about|around|roughly|close to|~)",
+                    low[max(0, m.start() - 30): m.end() + 30], re.I))
+                ctx = low[max(0, m.start() - 40): m.end() + 40].replace("\n", " ")
+                out.update({"value": val, "currency": "USD", "approx": approx,
+                            "note": re.sub(r"\s+", " ", ctx).strip()})
+                return out
+        return out
 
     def _find_country(self, text_lower: str, email: str):
         """优先从正文找国家名；找不到再从邮箱后缀推断"""
@@ -150,12 +203,22 @@ class InquiryExtractor:
                     return EMAIL_DOMAIN_COUNTRY[domain]
         return None
 
+    # 欧洲/亚洲常见公司后缀（Rule 提取兜底：BrightPromo BV 这类无“常见英文后缀”的公司）
+    _COMPANY_BV_RE = re.compile(
+        r"([A-Z][\w&.,'’\- ]{2,40}?\s+(?:B\.?V\.?|N\.?V\.?|A\/?S|Oy|"
+        r"Pte(?:\.)?(?: Ltd\.?)?|Pty(?:\.)?(?: Ltd\.?)?)\b)")
+    _CONTACT_PARTICLE = (
+        r"van der|van|von|de|den|der|ter|ten|zu|zum|du|di|da|del|la|le|bin|al")
+
     def _find_company(self, text: str):
-        """提取公司名：匹配 Co., Ltd / Inc / GmbH / Trading 等常见公司后缀"""
+        """提取公司名：匹配 Co., Ltd / Inc / GmbH / Trading / BV / NV 等公司后缀"""
         pattern = (r"([A-Z][\w&.,'’\- ]{2,40}?"
                    r"(?:Co\.,?\s?Ltd\.?|Ltd\.?|Inc\.?|LLC|GmbH|Corp\.?|"
                    r"Corporation|Company|Trading|Import|Export|Enterprises?))")
         m = re.search(pattern, text)
+        if not m:
+            # 公司名以 BV / NV / A/S / Oy 等结尾（荷/挪/芬/新/澳常见，无英文后缀词）
+            m = self._COMPANY_BV_RE.search(text)
         if not m:
             return None
         name = m.group(1).strip().rstrip(",.")
@@ -165,6 +228,7 @@ class InquiryExtractor:
             if sep in name.lower():
                 idx = name.lower().rindex(sep)
                 name = name[idx + len(sep):].strip()
+        # BV/NV 命中的情况：把公司名与其后缀补全（capture 已含后缀，无需再处理）
         return name if len(name) >= 3 else None
 
     def _find_website(self, text: str, email: str):
@@ -179,9 +243,11 @@ class InquiryExtractor:
     def _find_contact_name(self, text: str):
         """提取联系人：I'm Tom / This is Sarah / My name is John Smith
         注意：不能用 IGNORECASE，否则 'i?m' 会误匹配 sw*im* caps 里的 im！
-        用 \b 词边界保证只匹配独立的 I'm / This is / My name is"""
-        m = re.search(r"(?:\bI'?m\b|\bThis is\b|\bMy name is\b)\s+"
-                      r"([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)", text)
+        用 \b 词边界保证只匹配独立的 I'm / This is / My name is
+        支持欧洲姓名中间小写粒子：Sophie van Dijk / Jan de Vries / Luc la Roche"""
+        _name_opt = (r"[A-Z][a-zA-Z]+"
+                     r"(?:\s+(?:(?:" + self._CONTACT_PARTICLE + r")\s+)?[A-Z][a-zA-Z]+)?")
+        m = re.search(r"(?:\bI'?m\b|\bThis is\b|\bMy name is\b)\s+(" + _name_opt + ")", text)
         if m:
             return m.group(1)
         # 落款：邮件末尾紧跟的名字（取倒数几行里的大写开头词）
@@ -191,7 +257,7 @@ class InquiryExtractor:
             line = line.strip()
             if not line or len(line) <= 3:
                 continue
-            if re.fullmatch(r"[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?", line):
+            if re.fullmatch(_name_opt, line):
                 low_line = line.lower()
                 if any(kw in low_line for kw in
                        list(COUNTRY_KEYWORDS.keys()) +
@@ -265,14 +331,25 @@ class InquiryExtractor:
         """认证兴趣 vs 认证要求（优化十）：
         "What certificates do you have?"  → interest（了解，不阻塞报价）
         "We require CE certification."    → requirement（影响选品和成本）
+        Round2 TEST01 修复：客户也可能写成"CE and RoHS certification required"——
+        认证名词在前、required/must/need 动词在后。两种语序都要识别为 requirement。
         """
         interest = bool(re.search(
             r"\b(what|which)\s+certificat\w*|"
             r"\bdo\s+you\s+have\s+(any\s+)?certificat\w*|"
             r"\bany\s+certificat\w*", text_lower))
-        requirement = bool(re.search(
-            r"\b(require[sd]?|must\s+have|must\s+be|need[sed]?)\b[^.!?]{0,40}"
-            r"\b(certificat\w*|ce\b|en\s?71|reach|fda|rohs|bsci|sgs)\b", text_lower))
+        requirement = bool(
+            # 语序一：动词在前（We require CE certification.）
+            re.search(
+                r"\b(require[sd]?|must\s+have|must\s+be|need[sed]?)\b[^.!?]{0,40}"
+                r"\b(certificat\w*|ce\b|en\s?71|reach|fda|rohs|bsci|sgs)\b",
+                text_lower)
+            # 语序二：认证名词在前（CE and RoHS certification required / must be met）
+            or re.search(
+                r"\b(certificat\w*|ce\b|en\s?71|reach|fda|rohs|bsci|sgs)\b"
+                r"[^.!?]{0,45}\b(required|mandatory|must\s+(?:be|have|meet)|"
+                r"need[sed]?|require[sd]?|is\s+mandatory)\b",
+                text_lower))
         return {"interest": interest, "requirement": requirement}
 
     def _find_urgency(self, text_lower: str):
@@ -436,3 +513,123 @@ def semantic_conflict_roles(semantics: list) -> dict:
     for s in semantics or []:
         groups.setdefault(s["role"], set()).add(s["value"])
     return {r: sorted(v) for r, v in groups.items() if len(v) >= 2}
+
+
+# =====================================================================
+# Round 2 TEST01 共享原语：产品短语 / 规格信号
+# （单一实现，reply_strategy / insight / gapcheck 都从这里取口径，
+#   避免"客户已说明产品品类"被误判为"客户没说要什么产品"）
+# =====================================================================
+
+# 动词线索扩宽：旧版只认 interested in / looking for / need / want / require /
+# would like to ...；客户更常见的写法还有
+#   "looking to place an order for 5,000 pcs of Wireless ANC Earbuds"
+#   "We are planning to order X" / "wish to order X" / "we buy X" 等。
+_OBJECT_VERBS_RE = re.compile(
+    r"\b(?:interested\s+in|looking\s+for|looking\s+at|need|needs|want|require|"
+    r"wish(?:es)?\s+to\s+(?:order|buy|purchase|source)|"
+    r"looking\s+to\s+(?:buy|purchase|order|source)|"
+    r"looking\s+to\s+place\s+(?:an?\s+)?order\s+for|"
+    r"place\s+(?:an?\s+)?order\s+for|placing\s+(?:an?\s+)?order\s+for|"
+    r"planning(?:\s+to\s+(?:buy|order|purchase))?|"
+    r"(?:we|i)\s+(?:want|would\s+like)\s+to\s+(?:order|buy|purchase)|"
+    r"would\s+like(?:\s+to\s+(?:buy|order|purchase))?|"
+    r"want\s+to\s+(?:buy|purchase|order)|need\s+to\s+(?:buy|purchase|order))\s+"
+    r"([a-z0-9][a-z0-9\s\-/&]{2,60})", re.I)
+
+# "5,000 pcs of Wireless ANC Earbuds (TWS) for Germany" —— 数量在前的常见写法。
+# 注意要求紧跟单位后的 "of"，避免把裸数量当成产品。
+_QTY_OF_PRODUCT_RE = re.compile(
+    r"\b(\d[\d,]*)\s*(?:pcs|pieces|units|pairs|sets|cartons|ctns|k)\s+of\s+"
+    r"([a-z0-9][a-z0-9\s\-/&]{2,60})", re.I)
+
+# 产品候选里的通用占位词（与各模块旧口径一致，命中即视为"没有具体产品方向"）
+_GENERIC_OBJECT_COMMON_RE = re.compile(
+    r"^(?:your|the|some|any|these|those|all|more|several|a|an|our)?\s*"
+    r"(?:products?|items?|goods|things|stuff|models?|catalog|catalogue|brochure|range|"
+    r"specifications?|spec\s?sheets?|details|information|quotation|quote|price|prices|"
+    r"pricing|cost|offer|samples?|list)\b", re.I)
+
+# 电子/消费类产品的规格信号（旧版只认容量/尺寸/材质，识别不了
+# Bluetooth 5.4 / ANC / 40h battery / USB-C / TWS 这类关键规格）
+_ELECTRONICS_SPEC_RE = re.compile(
+    r"\b(bluetooth\s*\d(?:\.\d+)?|anc\b|active\s+noise\s+cancell\w*|"
+    r"noise\s+cancell\w*|tws\b|true\s+wireless|"
+    r"wireless\s+(?:earbuds?|headphones?|headsets?|speakers?)|"
+    r"usb[\s-]?c\b|usb\s+type\s*[-]?\s*c\b|type\s*[-]?\s*c\b|"
+    r"charging\s+case|wireless\s+charging|battery\s+life\b|"
+    r"battery\b[^.\n]{0,25}\d+\s*(?:h|hours?|hrs?)\b|"
+    r"\d+\s*(?:h|hours?|hrs?)\s+(?:battery|playback|playtime|talk\s*time)|"
+    r"ipx\d+\b|touch\s+control\w*|waterproof|sweatproof|led\s+indicat\w*|"
+    r"earbuds?|headphones?|headsets?)\b", re.I)
+
+_MATERIAL_COMMON_RE = re.compile(
+    r"\b(neoprene|silicone|latex|pvc|tpu|eva|stainless\s+steel|glass|aluminum|"
+    r"microfiber|nylon|polyester)\b", re.I)
+
+_SPEC_UNIT_COMMON_RE = re.compile(
+    r"\b\d+\s*(?:ml|l|oz|cl|cm|mm|inch|in|g|kg)\b", re.I)
+
+
+def _clean_product_chunk(raw: str) -> str:
+    """清洗产品候选片段：在标点/连接词处截断、去引导冠词、过滤通用词。"""
+    if not raw:
+        return ""
+    chunk = re.split(r"[,.;:\n]|\b(?:for|with|and|or|in|at|to|of|from)\b",
+                     raw, maxsplit=1)[0]
+    chunk = re.sub(r"\s+", " ", chunk).strip(" ,.-")
+    chunk = re.sub(r"^(?:your|our|the|a|an|some|own|their)\s+", "", chunk,
+                   flags=re.I).strip(" ,.-")
+    if not chunk or _GENERIC_OBJECT_COMMON_RE.match(chunk):
+        return ""
+    if len(chunk.split()) > 6:
+        chunk = " ".join(chunk.split()[:6])
+    return chunk
+
+
+def extract_customer_product(text: str) -> str:
+    """客户原文里"客户自己说的产品"（只用原话，绝不猜测）。
+
+    Round 2 TEST01 修复：支持
+      - "looking to place an order for 5,000 pcs of Wireless ANC Earbuds"
+      - "5,000 pcs of Wireless ANC Earbuds (TWS) for the German market"
+      - "interested in Wireless ANC Earbuds"
+    等常见表达；旧测试（swim caps / water bottle 等）行为不变。
+    """
+    text = text or ""
+    # ① 数量后置 of 写法最明确，先试它（capture 从单位后的 of 开始）
+    for m in _QTY_OF_PRODUCT_RE.finditer(text):
+        chunk = _clean_product_chunk(m.group(2))
+        if chunk:
+            return chunk
+    # ② 动词引导写法
+    for m in _OBJECT_VERBS_RE.finditer(text):
+        chunk = _clean_product_chunk(m.group(1))
+        if chunk:
+            return chunk
+    return ""
+
+
+def extract_customer_specs(text: str) -> list:
+    """客户原文里的规格信号清单（容量/尺寸/材质/电子规格），最多 3 条短标签。"""
+    text = text or ""
+    tokens = []
+    for m in _SPEC_UNIT_COMMON_RE.finditer(text):
+        v = re.sub(r"\s+", "", m.group(0)).lower()
+        if v not in tokens:
+            tokens.append(v)
+    mat = _MATERIAL_COMMON_RE.search(text)
+    if mat and mat.group(0).lower() not in tokens:
+        tokens.append(mat.group(0).lower())
+    for m in _ELECTRONICS_SPEC_RE.finditer(text):
+        v = re.sub(r"\s+", " ", m.group(0)).strip().lower()
+        if v not in tokens:
+            tokens.append(v)
+    return tokens[:3]
+
+
+def has_customer_spec_signal(text: str) -> bool:
+    """客户原文是否含有任何规格锚点（尺寸/容量/材质/电子规格）。"""
+    return bool(_SPEC_UNIT_COMMON_RE.search(text or "")
+                or _MATERIAL_COMMON_RE.search(text or "")
+                or _ELECTRONICS_SPEC_RE.search(text or ""))

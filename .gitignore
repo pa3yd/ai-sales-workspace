@@ -27,3 +27,11 @@ _smoke.log
 # —— 个人测试输入与真实询盘样例（公开仓库不带）——
 my_inquiry.txt
 真实询盘_*.txt
+
+# —— 本地虚拟环境 ——
+.venv/
+venv/
+
+# —— Codex 本地辅助目录 / 测试输出产物 ——
+.agents/
+*.out

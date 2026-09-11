@@ -25,12 +25,35 @@ LEVEL_META = {
     "C": {"icon": "💡", "title": "可选问题", "tip": "参考信息，建议第二封信再问，别一次问太多"},
 }
 
+
+def customer_requirement_detailed_enough(text: str, info: dict = None) -> bool:
+    """客户侧需求完整度：不依赖产品库匹配或供应能力。"""
+    info = info or {}
+    low = str(text or "").lower()
+    signals = sum(bool(x) for x in (
+        info.get("product_query") or info.get("intent"),
+        info.get("quantity"),
+        info.get("target_price"),
+        info.get("country") or info.get("destination"),
+    ))
+    signals += sum(1 for pat in (
+        r"bluetooth\s*\d", r"\banc\b|active noise cancellation",
+        r"\b\d+\s*(?:hours?|h)\b", r"black|white|colou?r",
+        r"custom\s+logo", r"retail\s+packag", r"\bfob\b",
+        r"\bce\b|\brohs\b", r"\bsamples?\b", r"updated\s+quot",
+    ) if re.search(pat, low, re.I))
+    return signals >= 7
+
 # 关键字段定义：(字段名, 中文名, 等级, 英文追问句)
-# 等级口径（业务逻辑优化后）：
-#   A 类 = 缺失会直接影响产品选择 / SKU / 成本 / 正式报价 / 订单执行
-#   联系方式（邮箱/公司）缺失不阻塞报价 → 归 B 类（优化九）
+# 等级口径（业务逻辑优化后 + Round 2 TEST02）：
+#   A 类 = 缺失会直接影响产品选择 / SKU 匹配 / 报价档位（产品匹配阶段必须确认）
+#   认证默认 B（通常 NON_BLOCKING，正式报价/合规阶段才关键）；
+#   包装/付款默认 C（ASL_LATER，不在早期产品澄清时索取）；
+#   邮箱默认 C（PROFILE_ONLY / 渠道感知，回复可直接走原渠道）
+#   —— 追问邮件是否真的问某项，由 ASK_NOW/ASK_LATER/DO_NOT_ASK 时机判定（classify_ask），
+#      等级只用于 UI 分组展示，避免"等级=一定会问"的误解。
 FIELD_DEFS = [
-    # ---------- ⚠️ A 类：报价/产品决策必需 ----------
+    # ---------- ⚠️ A 类：产品选择/SKU/报价档位必需 ----------
     ("product_spec", "产品型号 / 规格", "A",
      "Which model or specification are you interested in?"),
     ("quantity", "采购数量", "A",
@@ -39,24 +62,24 @@ FIELD_DEFS = [
      "Do you need any customization, such as logo printing, specific color or size?"),
     ("destination", "目的地（收货国家 / 港口）", "A",
      "Which country or port should we deliver to?"),
-    ("certification", "关键认证要求", "A",
-     "Do you need any specific certification (e.g. CE, EN71, REACH, FDA)?"),
 
-    # ---------- 📌 B 类：建议确认 ----------
-    ("email", "联系邮箱", "B",
-     "Could you please share your email address so we can send the quotation?"),
+    # ---------- 📌 B 类：建议确认（影响报价口径/合规，不阻塞产品识别） ----------
+    ("certification", "关键认证要求", "B",
+     "Do you have any specific compliance or testing requirements for your market?"),
     ("company", "公司信息", "B",
      "Could you share your company name and website?"),
     ("delivery", "目标交期", "B",
      "What is your target delivery date?"),
-    ("packaging", "包装要求", "B",
-     "Any specific packaging requirements (e.g. polybag, printed box, barcode)?"),
-    ("payment", "付款方式", "B",
-     "What payment terms do you usually work with (e.g. T/T, L/C at sight)?"),
     ("incoterm", "贸易术语", "B",
      "Which trade term do you prefer (e.g. FOB, CIF, EXW, DDP)?"),
 
-    # ---------- 🟢 C 类：可选问题（参考信息，第二封信再问） ----------
+    # ---------- 🟢 C 类：可选 / 后续确认 / 档案类（别在第一封信里全问） ----------
+    ("email", "联系邮箱", "C",
+     "Could you please share your email address so we can send the quotation?"),
+    ("packaging", "包装要求", "C",
+     "Any specific packaging requirements (e.g. polybag, printed box, barcode)?"),
+    ("payment", "付款方式", "C",
+     "What payment terms do you usually work with (e.g. T/T, L/C at sight)?"),
     ("target_price", "目标价格", "C",
      "If you have a target price in mind, please let us know - it helps us "
      "propose the most suitable solution for you."),
@@ -217,8 +240,10 @@ def detect_missing(text: str, info: dict, matches: list, known_email: str = "") 
     matches = matches or []
     low = text or ""
 
-    # 产品型号：匹配到产品（≥0.3）就算"客户说清要什么了"
-    # 阈值别定太高——"5000pcs neoprnee swim caps" 实际匹配分只有 0.4
+    # 产品型号：匹配到产品（≥0.3）才算"型号/规格层面已明确"；
+    # 若客户只说清了品类（如 Wireless ANC Earbuds + 详细规格），product_spec 走
+    # 下面的智能追问分支（引用客户原话要 reference model / photo），绝不泛泛问
+    # "Which model or specification are you interested in?"
     has_spec = any((m.get("match_score") or 0) >= 0.3 for m in matches)
 
     # 邮箱三来源任一命中即算"已知"：① 本次提取 ② 客户档案（历史询盘渠道带来）
@@ -269,12 +294,15 @@ def detect_missing(text: str, info: dict, matches: list, known_email: str = "") 
             "Which country in Europe should we deliver to?",
             "客户只说了欧洲市场，没给具体国家，运费和认证要求差别很大")
 
-    # ③ 只说 certificates，没说具体哪个认证
+    # ③ 客户提到 certificates 但没说具体哪个认证（Round 2 TEST02 §6）：
+    #    避免机械罗列 "Do you need CE, EN71, REACH, FDA?" —— 不同产品/市场
+    #    合规要求不同，用上下文化的问法；是否现在问由时机判定决定
     if (not have.get("certification")
             and re.search(r"\bcertificat\w*", low, re.I)):
         targeted["certification"] = (
-            "Which certifications do you require - CE, EN71, REACH, or others?",
-            "客户提到认证，但没说具体要哪个标准，不同认证成本差异大")
+            "Do you have any specific compliance or testing requirements for your market?",
+            "客户提到认证，但没说具体要哪个标准——不同产品/市场合规要求不同，"
+            "用上下文化问法（不机械罗列标准清单）")
 
     # ④ 数量含糊："about 3000pcs" / "1000-2000pcs"
     if (not have.get("quantity") and _VAGUE_QTY_RE.search(low)
@@ -340,6 +368,36 @@ def detect_missing(text: str, info: dict, matches: list, known_email: str = "") 
                                      "产品型号是报价的第一前提",
                            "question": f'You mentioned "{frag}" - which {noun} '
                                        "would you prefer?"})
+
+    # Round 2 TEST02：给每个缺失项标注 ASK_NOW / ASK_LATER / DO_NOT_ASK
+    # （UNKNOWN ≠ 自动 ASK。等级只用于分组展示；追问邮件按时机真正决定问不问）
+    try:
+        from agent.reply_strategy import classify_ask, infer_sales_stage
+        _matched = any((m.get("match_score") or 0) >= 0.5
+                       or m.get("hit_keywords") for m in matches)
+        _stage = infer_sales_stage(
+            product=None, matches=matches if _matched else None,
+            readiness_status="", intent="")
+        for _m in missing:
+            _c = classify_ask(
+                _m.get("key") or "", _stage,
+                has_quantity=bool(info.get("quantity")),
+                has_email=email_known, text=low)
+            _m["ask_timing"] = _c["ask"]
+            _m["ask_timing_cn"] = _c["ask_cn"]
+            _m["ask_reason"] = _c["reason"]
+            _m["advance_stage"] = _stage
+        if customer_requirement_detailed_enough(low, info):
+            for _m in missing:
+                if _m.get("key") == "product_spec":
+                    _m["ask_timing"] = "ASK_LATER"
+                    _m["ask_timing_cn"] = "以后问（可选增强）"
+                    _m["ask_reason"] = "客户技术/商务需求已足够推进报价，规格补充/参考资料不是客户侧阻塞项"
+                    _m["requirement_type"] = "OPTIONAL_ENHANCEMENT"
+    except Exception:
+        for _m in missing:
+            _m.setdefault("ask_timing", "ASK_LATER")
+            _m.setdefault("ask_reason", "")
     return missing
 
 
@@ -359,15 +417,24 @@ def readiness(missing: list) -> tuple:
 
 
 def build_followup_email(missing: list, info: dict, seller_company: str = "",
-                         levels=("A", "B")) -> str:
-    """用缺失项拼一封英文追问邮件（离线规则版）。
+                         levels=("A", "B"), max_questions: int = 3) -> str:
+    """用缺失项拼一封英文追问邮件（离线规则版）——Round 2 TEST02 重写。
 
-    levels: 要追问的等级，默认 A+B（C 类建议第二封信再问，否则容易把客户问跑）
+    原则：ASK THE MINIMUM INFORMATION REQUIRED TO ADVANCE THE DEAL.
+      - 只挑 ask_timing == ASK_NOW 的缺失项（产品识别/报价档位真正被阻塞的字段）；
+      - 数量上限默认 1-3（默认优先 1-2，绝不一次问满整份 CRM 字段）；
+      - 邮箱/付款/包装/Incoterm/档案等 ASK_LATER / DO_NOT_ASK 项不进邮件；
+      - 结尾不做无 SLA 的 "within 24 hours" 承诺，改用安全推进句。
+
+    levels: 兼容旧调用（A/B/C 分组），只影响“从哪些组里挑”，真正取舍看 ask_timing。
     """
-    picked = [m for m in (missing or []) if m["level"] in levels]
+    missing = missing or []
+    info = info or {}
+    picked = [m for m in missing
+              if m["level"] in levels
+              and m.get("ask_timing") == "ASK_NOW"][:max_questions]
     if not picked:
         return ""
-    info = info or {}
     raw_name = (info.get("contact_name") or "").strip()
     first = raw_name.split()[0] if raw_name else ""
 
@@ -378,8 +445,8 @@ def build_followup_email(missing: list, info: dict, seller_company: str = "",
     for i, m in enumerate(picked, 1):
         lines.append(f"{i}. {m['question']}")
     lines.append("")
-    lines.append("Once we have these details, we will send you our best offer "
-                 "within 24 hours.")
+    lines.append("Once we have these details, we will check the applicable options "
+                 "and come back to you with our proposal.")
     lines.append("")
     lines.append("Best regards,")
     if seller_company:

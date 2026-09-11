@@ -95,10 +95,11 @@ def run_test_01(engine):
     check("Test 01 · 无 P0 动作（非阻塞信息不升 P0）",
           all(a.get("priority") != "P0" for a in acts),
           "P0 数 = " + str(sum(1 for a in acts if a.get("priority") == "P0")))
-    rec = next((a for a in acts if a.get("action") == "recommend_products"), None)
+    rec = next((a for a in acts if a.get("action") in
+                ("recommend_products", "match_closest_product")), None)
     check("Test 01 · 下一步动作 = 查看产品库并匹配候选产品（不是确认产品类别/索取产品）",
           rec is not None and "查看产品库并匹配候选产品" in (rec.get("reason") or ""),
-          (rec or {}).get("reason", "（无 recommend_products 动作）")[:50])
+          (rec or {}).get("reason", "（无匹配动作）")[:60])
     check("Test 01 · 草稿不反问产品类别（which/what product category）",
           not re.search(r"(which|what)\s+product\s+categor", draft, re.I))
     check("Test 01 · 缺失检测为智能追问（引用客户品类原话，不泛泛问什么产品）",

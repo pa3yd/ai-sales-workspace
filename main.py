@@ -16,6 +16,7 @@ import os
 import sys
 import json
 import argparse
+import re
 
 sys.stdout.reconfigure(encoding="utf-8")  # Windows 控制台中文不乱码
 
@@ -101,6 +102,31 @@ def analyze(text: str, extractor, matcher, client, previous: dict = None) -> dic
     全部为新增字段，旧字段原样保留，向后兼容。
     """
     info = extractor.extract(text)              # ① 提取
+    # Runtime fact evolution：客户把旧数量改成新数量时，必须在所有下游
+    # 决策前先形成当前事实。否则 UI / 邮件会把 "3,000 instead of 5,000"
+    # 误判成数量冲突，或继续把旧报价数量当当前数量。
+    _rev = _extract_quantity_revision(text)
+    if _rev:
+        info["quantity"] = _rev["current"]
+        info["quantity_unit"] = _rev["unit"]
+        info["quantity_revision"] = _rev
+    # TEST03：规则模式下也把"客户原话的产品短语"补进 info.product_query——
+    # 客户明确说了产品 ≠ 产品库匹配成功；product_query 只承担“客户说了什么”，
+    # 产品库是否匹配由 matcher/matches 独立表达，两者不再混为一谈。
+    if not (info.get("product_query") or "").strip():
+        try:
+            from agent.extractor import extract_customer_product
+            _phrase = extract_customer_product(text)
+            if _phrase:
+                info["product_query"] = _phrase
+        except Exception:
+            pass
+    if not (info.get("product_query") or "").strip():
+        _phrase = (_extract_labeled_product_phrase(text) or _extract_product_is_phrase(text)
+                   or _extract_need_product_phrase(text))
+        if _phrase:
+            info["product_query"] = _phrase
+    info.update({k: v for k, v in _extract_labeled_requirement_fields(text).items() if v and not info.get(k)})
     matches = matcher.match(text)               # ② 产品匹配
     lead = LeadScorer().score(info, matches, text=text)  # ③ 六维可解释线索评分
 
@@ -165,6 +191,24 @@ def analyze(text: str, extractor, matcher, client, previous: dict = None) -> dic
         info, reply_product, client, text=text, insight=insight,
         catalog_products=catalog_products, previous=previous,
         matches=matches, facts_ctx=reply_ctx)
+    if info.get("quantity_revision"):
+        try:
+            from workbench import email_unified as _email_runtime
+        except Exception:
+            try:
+                import email_unified as _email_runtime
+            except Exception:
+                _email_runtime = None
+        if _email_runtime:
+            _mail = _email_runtime.generate_customer_email({
+                "text": text, "info": info, "matches": matches, "gaps": gaps,
+                "stored_draft": "", "seller_company": "",
+                "customer_product": info.get("product_query") or "",
+                "quotation_ready": False, "known": [k for k, v in info.items() if v],
+            }, intent="AUTO")
+            if (_mail.get("body") or "").strip():
+                draft = _mail["body"]
+                draft_issues = _mail.get("issues") or []
     if draft_issues:
         print(f"   [校验警告] 回复草稿仍有 {len(draft_issues)} 处疑似无依据内容，"
               f"请人工复核：{'；'.join(draft_issues[:3])}")
@@ -189,6 +233,93 @@ def analyze(text: str, extractor, matcher, client, previous: dict = None) -> dic
             # Fact Guard：草稿含未经公司知识库验证的商业承诺 → 禁止自动发送
             "human_review_required": bool(draft_issues),
             "facts": facts_layer, "reply_context": reply_ctx}
+
+
+def _extract_labeled_requirement_fields(text: str) -> dict:
+    """Parse common RFQ label lines without changing the AI decision model."""
+    labels = {
+        "material": ("material", "材质"),
+        "capacity": ("capacity", "容量"),
+        "colors": ("colors", "color", "colours", "colour", "颜色"),
+        "customization": ("customization", "customisation", "定制"),
+        "incoterm": ("incoterm", "trade term", "贸易条款"),
+        "destination": ("destination", "ship to", "目的地"),
+        "lead_time": ("lead time", "delivery time", "timeline", "交期"),
+        "samples": ("samples", "sample", "样品"),
+    }
+    out = {}
+    lines = str(text or "").splitlines()
+    for key, names in labels.items():
+        for name in names:
+            pat = rf"^\s*{re.escape(name)}\s*[:：-]\s*(.+?)\s*$"
+            m = next((re.search(pat, line, re.I) for line in lines if re.search(pat, line, re.I)), None)
+            if m:
+                out[key] = " ".join(m.group(1).split()).strip(" ,.;")[:120]
+                break
+    return out
+
+
+def _extract_quantity_revision(text: str) -> dict:
+    """Resolve revised quantity before runtime decisions.
+
+    "revise the first order quantity to 3,000 pcs instead of 5,000 pcs"
+    means current=3000 and previous=5000. It is a revision, not a conflict.
+    """
+    m = re.search(
+        r"\b(?:revise|revised|update|updated|change|changed|adjust|adjusted)"
+        r"[^.\n]{0,80}?\b(?:quantity|order)[^.\n]{0,40}?\bto\s+"
+        r"(\d[\d,]*)\s*(pcs|pieces|sets|units|pairs)?"
+        r"[^.\n]{0,60}?\binstead\s+of\s+"
+        r"(\d[\d,]*)\s*(pcs|pieces|sets|units|pairs)?",
+        text or "", re.I)
+    if not m:
+        return {}
+    current = int(m.group(1).replace(",", ""))
+    previous = int(m.group(3).replace(",", ""))
+    unit = (m.group(2) or m.group(4) or "pcs").lower()
+    return {"current": current, "previous": previous, "unit": unit,
+            "evolution": "REVISION", "conflict": False,
+            "source": "quantity_revision_phrase"}
+
+
+def _extract_labeled_product_phrase(text: str) -> str:
+    """Fallback for labeled RFQ lines such as: Product: Insulated Food Container."""
+    m = re.search(r"(?im)^\s*(?:product|item|project)\s*[:：-]\s*(.+?)\s*$", text or "")
+    if not m:
+        return ""
+    raw = re.split(r"[,.;:\n]|\s+with\s+|\s+for\s+", m.group(1), maxsplit=1, flags=re.I)[0]
+    return " ".join(raw.split()).strip(" ,.-")[:90]
+
+
+def _extract_product_is_phrase(text: str) -> str:
+    """Fallback for explicit wording such as: The product is Wireless ANC Earbuds."""
+    m = re.search(
+        r"\b(?:the\s+)?product\s+is\s+([A-Za-z0-9][A-Za-z0-9 /&+-]{2,80})",
+        text or "", re.I)
+    if not m:
+        return ""
+    raw = re.split(r"[,.;:\n]|\s+with\s+|\s+for\s+", m.group(1),
+                   maxsplit=1, flags=re.I)[0]
+    return " ".join(raw.split()).strip(" ,.-")
+
+
+def _extract_need_product_phrase(text: str) -> str:
+    """Fallback for wording such as: We need 1,000 pcs USB-C Travel Charger."""
+    patterns = [
+        r"\b(?:we\s+)?(?:need|want|require|looking\s+for)\s+\d[\d,]*\s*(?:pcs|pieces|sets|units|pairs)\s+(?:of\s+)?([A-Za-z0-9][A-Za-z0-9 /&+-]{2,80})",
+        r"\b(?:we\s+)?(?:need|want|require|looking\s+for)\s+([A-Za-z0-9][A-Za-z0-9 /&+-]{2,80})\s*,?\s*\d[\d,]*\s*(?:pcs|pieces|sets|units|pairs)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text or "", re.I)
+        if not m:
+            continue
+        raw = re.split(r"[,.;:\n]|\s+with\s+|\s+for\s+|\s+please\s+",
+                       m.group(1), maxsplit=1, flags=re.I)[0]
+        phrase = " ".join(raw.split()).strip(" ,.-")
+        phrase = re.sub(r"^(?:of|for)\s+", "", phrase, flags=re.I).strip()
+        if phrase and not re.fullmatch(r"(?:quote|quotation|price|catalog|sample)s?", phrase, re.I):
+            return phrase
+    return ""
 
 
 def print_report(index: int, text: str, report: dict):

@@ -17,6 +17,16 @@
 
 import re
 
+from agent.extractor import (
+    extract_customer_product, extract_customer_specs, has_customer_spec_signal,
+)
+
+# Round 2 TEST01：渠道感知字段（EMAIL 渠道 + 发件人邮箱已知 → 绝不索要邮箱）
+INQUIRY_CHANNEL_EMAIL = "EMAIL"
+INQUIRY_CHANNEL_ALIBABA = "ALIBABA"
+INQUIRY_CHANNEL_WHATSAPP = "WHATSAPP"
+INQUIRY_CHANNEL_WEBCHAT = "WEB_CHAT"
+
 # ---------- 与 workbench/gapcheck 同源的正则（保持判断口径一致） ----------
 _UNCERTAIN_RE = re.compile(
     r"\b(not\s+sure|not\s+decided|unsure|undecided|haven'?t\s+decided|"
@@ -44,7 +54,11 @@ _CERT_INTEREST_RE = re.compile(
     r"\bcertificat\w*\s+(do\s+you\s+have|available)\b", re.I)
 _CERT_REQUIRE_RE = re.compile(
     r"\b(require[sd]?|must\s+have|must\s+be|need[sed]?)\b[^.!?]{0,40}"
-    r"\b(certificat\w*|CE\b|EN\s?71|REACH|FDA|RoHS|BSCI|SGS)\b", re.I)
+    r"\b(certificat\w*|CE\b|EN\s?71|REACH|FDA|RoHS|BSCI|SGS)\b"
+    r"|"   # Round 2 TEST01：客户也可能写成 "CE and RoHS certification required"。
+    r"\b(certificat\w*|CE\b|EN\s?71|REACH|FDA|RoHS|BSCI|SGS)\b"
+    r"[^.!?]{0,45}\b(?:is\s+|are\s+)?(required|mandatory|is\s+mandatory|"
+    r"must\s+(?:be|have|meet))\b", re.I)
 
 # 紧急表达（紧急度 ≠ 采购意向，分开判断）
 _URGENT_HIGH_RE = re.compile(r"\b(urgent|asap|immediate|immediately|rush\s+order)\b", re.I)
@@ -197,6 +211,36 @@ def _sales_advice(field: str, values: list) -> str:
     return f"客户在 {joined} 之间未定：可同时给出两种方案的报价与参数供对比。"
 
 
+# Round 2 TEST01 修复：数量"大概值"判定必须基于数量所在上下文的 hedge 词，
+# 而不是全文搜索——否则
+#   "Could you please send us your quotation"（礼貌 could）与
+#   "USD 8.50 - 9.50"（价格区间）
+# 都会把明确数量 5,000 pcs 误标成"大概值/未确认"。
+_QTY_TOKEN_W_UNIT_RE = re.compile(
+    r"(\d[\d,]*)\s*(pcs|pieces|units|pairs|sets|cartons|ctns)\b", re.I)
+_QTY_RANGE_W_UNIT_RE = re.compile(
+    r"(\d[\d,]*)\s*(?:or|to|[-–~])\s*(\d[\d,]*)\s*"
+    r"(pcs|pieces|units|pairs|sets|cartons|ctns)\b", re.I)
+_QTY_HEDGE_NEAR_RE = re.compile(
+    r"\b(about|around|approx\.?|approximately|or\s+so|more\s+or\s+less|"
+    r"may|might|potentially|estimated?|initial\s+quantity|trial\s+order|"
+    r"expected\s+quantity|target\s+quantity|planned|roughly|up\s+to|"
+    r"subject\s+to)\b", re.I)
+
+
+def _vague_quantity_fragments(text: str) -> list:
+    """只返回"数量本身在约数语境"的片段（价格区间 / 礼貌 could 不误伤）。"""
+    low = (text or "").lower()
+    frags = []
+    for m in _QTY_RANGE_W_UNIT_RE.finditer(low):
+        frags.append(f"{m.group(1)}-{m.group(2)} {m.group(3)}")
+    for m in _QTY_TOKEN_W_UNIT_RE.finditer(low):
+        ctx = low[max(0, m.start() - 70): m.end() + 45]
+        if _QTY_HEDGE_NEAR_RE.search(ctx):
+            frags.append(m.group(0))
+    return frags
+
+
 def detect_partially_confirmed(text: str, info: dict) -> list:
     """识别"客户给了候选值但没最终确认"的字段。
 
@@ -227,23 +271,17 @@ def detect_partially_confirmed(text: str, info: dict) -> list:
             "sales_advice": _sales_advice(field, values),
         })
 
-    # 数量含糊："about 3000 pcs" —— 有数但不精确
-    # 第五轮补丁 02：扩展 hedge 词（may/might/could/potentially/trial/initial quantity 等），
-    # 把所有"客户表达的不是确定采购意向"的数量都标 partially_confirmed，
-    # 不应被 Quote Readiness / extractor 当成 confirmed。
+    # 数量含糊："about 3,000 pcs" / "2,000-3,000 pcs" —— 有数但不精确
+    # Round 2 TEST01：判定只看数量上下文（±70/45 字符窗口）内是否有约数词，
+    # 不再全文搜索（"Could you please..." / "USD 8.50 - 9.50" 不再误伤明确数量）。
     if not any(p["field"] == "quantity" for p in out):
-        if ((_VAGUE_QTY_RE.search(low) or _APPROX_HEDGE_RE.search(low))
-                and _QUANTITY_RE.search(low)):
-            m = _QUANTITY_RE.search(low)
-            vals = [m.group(0).strip()]
-            # 区分"模糊量"和"多档候选量"（第五轮补丁 02）
-            quote_text = m.group(0).strip()
-            if _APPROX_HEDGE_RE.search(low):
-                quote_text = f"approximately {quote_text} (hedge word detected: may/might/could/potential/trial/initial)"
+        vq = _vague_quantity_fragments(text)
+        if vq:
+            frag = vq[0]
             out.append({"field": "quantity", "status": "partially_confirmed",
                         "status_text": "尚未最终确认",
-                        "values": vals, "customer_options": vals,
-                        "quote": quote_text,
+                        "values": [frag], "customer_options": [frag],
+                        "quote": f"approximately {frag}",
                         "question": "Could you confirm the quantity - is that per order?",
                         "sales_advice": "数量是大概值/可能值：初步报价可先按该量给，"
                                         "正式报价前确认准确数量。勿在首轮草稿中标记为 confirmed。"})
@@ -285,22 +323,10 @@ def customer_product_phrase(text: str) -> str:
 
     例："We are interested in Stainless Steel Water Bottle, 500ml or 750ml"
         → "Stainless Steel Water Bottle"
-    与 reply_strategy.customer_product_phrase 同源同口径。
+    Round 2 TEST01：统一委托 agent.extractor.extract_customer_product（与
+    reply_strategy 同口径），支持 "5,000 pcs of Wireless ANC Earbuds" 写法。
     """
-    for m in _OBJECT_RE_P.finditer(text or ""):
-        raw = re.split(r"[,.;:\n]|\b(?:for|with|and|or|in|at|to|of|from)\b",
-                       m.group(1), maxsplit=1)[0]
-        raw = re.sub(r"\s+", " ", raw).strip(" ,.-")
-        # 去掉引导冠词/物主代词："your Stainless Steel Water Bottle"
-        #   → "Stainless Steel Water Bottle"（只留客户所述品类本身）
-        raw = re.sub(r"^(?:your|our|the|a|an|some|own)\s+", "", raw,
-                     flags=re.I).strip(" ,.-")
-        if not raw or _GENERIC_OBJECT_RE_P.match(raw):
-            continue
-        if len(raw.split()) > 6:
-            raw = " ".join(raw.split()[:6])
-        return raw
-    return ""
+    return extract_customer_product(text)
 
 
 def build_product_hierarchy(text: str, info: dict, matches: list,
@@ -333,6 +359,8 @@ def build_product_hierarchy(text: str, info: dict, matches: list,
         if p["field"] in ("capacity", "size", "specification"):
             spec_vals += p.get("values", [])
     spec_tokens = re.findall(r"\b\d+\s*(?:ml|l|oz|cl|cm|mm|inch|g|kg)\b", low)
+    # Round 2 TEST01：电子/消费类规格信号（Bluetooth / ANC / USB-C / battery hours…）
+    spec_signals = extract_customer_specs(text)
 
     category_state = REQ_CONFIRMED if category_known else REQ_UNKNOWN
     type_state = (REQ_NA if not category_known
@@ -341,7 +369,7 @@ def build_product_hierarchy(text: str, info: dict, matches: list,
                    else (REQ_NA if not category_known else REQ_UNKNOWN))
     if open_spec:
         spec_state = REQ_PARTIAL
-    elif spec_vals or spec_tokens or has_match:
+    elif spec_vals or spec_tokens or spec_signals or has_match:
         spec_state = REQ_CONFIRMED
     else:
         spec_state = REQ_NA if not category_known else REQ_UNKNOWN
@@ -351,6 +379,10 @@ def build_product_hierarchy(text: str, info: dict, matches: list,
         final_state = REQ_CONFIRMED
     else:
         final_state = REQ_PENDING
+
+    _spec_value = (" / ".join(spec_vals[:2])
+                   or "、".join(spec_tokens[:2])
+                   or "、".join(spec_signals[:2])) or None
 
     return {
         "levels": [
@@ -370,9 +402,10 @@ def build_product_hierarchy(text: str, info: dict, matches: list,
              "source": "customer_information" if model_m else None},
             {"level": "specification", "short": "规格",
              "label": "Specification · 规格",
-             "value": (" / ".join(spec_vals[:2]) or "、".join(spec_tokens[:2])) or None,
+             "value": _spec_value,
              "state": spec_state,
-             "source": ("customer_information" if (spec_vals or spec_tokens)
+             "source": ("customer_information" if (spec_vals or spec_tokens
+                                                   or spec_signals)
                         else None)},
             {"level": "final_selection", "short": "最终选型",
              "label": "Final Selection · 最终选型",
@@ -491,8 +524,10 @@ def assess_requirements(text: str, info: dict, matches: list,
         "model": (REQ_CONFIRMED if _MODEL_VALUE_RE.search(low)
                   else (REQ_NA if not category_known else REQ_UNKNOWN)),
         "specification": st(
-            (has_match or bool(re.search(r"\b\d+\s*(?:ml|l|oz|cl|cm|mm|inch|g|kg)\b", low))
-             or bool(_MATERIAL_RE_P.search(low)))
+            (has_match
+             or bool(re.search(r"\b\d+\s*(?:ml|l|oz|cl|cm|mm|inch|g|kg)\b", low))
+             or bool(_MATERIAL_RE_P.search(low))
+             or has_customer_spec_signal(low))
             and not any(p["field"] == "specification" for p in partially),
             partial=any(p["field"] in ("capacity", "specification", "size") for p in partially)),
         # 最终选型（Final Commercial Confirmation）：
@@ -612,6 +647,255 @@ def _detect_deadline(text: str):
     return period, days
 
 
+# =========================================================================
+# Round 2 TEST01：客户需求完整性 ≠ 内部产品匹配
+# -------------------------------------------------------------------------
+# 核心口径：
+#   requirement_completeness —— 只看"客户把需求说清楚了没有"（产品方向/规格/
+#     数量/价格/认证/目的地/交期/商务条件……），与产品库是否有对应 SKU 无关。
+#   product_match           —— 只看"产品库有没有已确认的 SKU 对应"。
+#   一个客户可以同时是：需求完整性 HIGH + 产品匹配 UNRESOLVED。
+# =========================================================================
+
+COMPLETENESS_HIGH = "HIGH"
+COMPLETENESS_MEDIUM = "MEDIUM"
+COMPLETENESS_LOW = "LOW"
+
+COMPLETENESS_CN = {
+    COMPLETENESS_HIGH: "高",
+    COMPLETENESS_MEDIUM: "中",
+    COMPLETENESS_LOW: "低",
+}
+
+PRODUCT_MATCH_MATCHED = "MATCHED"
+PRODUCT_MATCH_PARTIAL = "PARTIAL_MATCH"
+PRODUCT_MATCH_UNRESOLVED = "UNRESOLVED"
+PRODUCT_MATCH_INSUFFICIENT = "INSUFFICIENT_INFORMATION"
+
+PRODUCT_MATCH_CN = {
+    PRODUCT_MATCH_MATCHED: "已匹配（产品库有确认 SKU）",
+    PRODUCT_MATCH_PARTIAL: "候选匹配（需客户/内部确认）",
+    PRODUCT_MATCH_UNRESOLVED: "未解决（产品库暂无对应 SKU，内部待选型）",
+    PRODUCT_MATCH_INSUFFICIENT: "规格不足（客户未提供产品方向）",
+}
+
+# ---- TEST03：把"客户侧产品需求"与"我方供应侧能力"显式分开 ----
+#   一个客户可以同时是：需求完整 HIGH + 产品匹配 NO_MATCH + 供应能力 UNKNOWN，
+#   这不是"客户信息缺失"，更不是低质量线索。
+# out-of-catalog：客户需求真实完整，但当前产品库没有对应品类（≠ 客户没说清）
+OUT_OF_CATALOG = "OUT_OF_CATALOG"
+IN_CATALOG = "IN_CATALOG"
+CUSTOMER_PRODUCT_KNOWN = "CUSTOMER_PRODUCT_KNOWN"
+CUSTOMER_PRODUCT_UNKNOWN = "CUSTOMER_PRODUCT_UNKNOWN"
+SUPPLIER_CAPABLE = "CAPABLE"
+SUPPLIER_UNKNOWN = "UNKNOWN"          # 供应能力待内部确认（库内无匹配 ≠ 供应失败）
+SUPPLIER_UNAVAILABLE = "UNAVAILABLE"
+
+PRODUCT_MATCH_NO_MATCH = "NO_MATCH"   # UI/商机分类短标签：库内无匹配
+
+OUT_OF_CATALOG_CN = "非现有产品线机会"
+
+
+def _has_cert_mention(cert: dict) -> bool:
+    return bool(cert) and (cert.get("certification_status") or "unknown") != "unknown"
+
+
+def assess_requirement_completeness(text: str, info: dict, matches: list,
+                                    cert: dict = None) -> dict:
+    """需求完整性：只衡量客户把需求说得多清楚，与产品库是否匹配无关。
+
+    逐项判定（12 项客户侧需求信息），返回 {level, score, provided, missing, basis}。
+    """
+    info = info or {}
+    matches = matches or []
+    text = text or ""
+    low = text.lower()
+    cert = cert or certify_split(text)
+    phrase = extract_customer_product(text) or _norm(info.get("product_query"))
+    has_match = any((m.get("match_score") or 0) >= 0.3 for m in matches)
+    specs = extract_customer_specs(text)
+    _vague = _vague_quantity_fragments(text)
+
+    checks = [
+        ("产品方向", bool(phrase or specs or has_match)),
+        ("数量", bool(info.get("quantity") or _vague)),
+        ("规格", bool(specs or has_match)),
+        ("目标价", bool(info.get("target_price"))
+         or bool(re.search(r"\btarget\s+price\b|(?:usd|us\$|\$)\s*\d", low))),
+        ("认证", _has_cert_mention(cert)),
+        ("目的地", bool(info.get("country"))),
+        ("贸易术语", bool(re.search(r"\b(fob|cif|exw|ddp|ddu|dap|fca|cfr|cnf)\b", low))),
+        ("付款方式", bool(re.search(
+            r"\b(t\s?/\s?t|l\s?/\s?c|deposit|balance|payment\s+terms?)\b", low))),
+        ("定制/logo", bool(re.search(r"\b(custom\w*|logo|oem|odm|print\w*|emboss\w*)\b", low))),
+        # TEST03：Individual white box / white box 等也属于包装要求（不只看包装专有词）
+        ("包装", bool(re.search(
+            r"\b(packag\w*|gift\s?box|white\s*box|blister|poly\s?bag)\b", low))),
+        ("交期/时间线", bool(_DEADLINE_RE.search(low) or _URGENT_HIGH_RE.search(low)
+                          or re.search(r"\bafter\s+(?:the\s+)?sample\s+approval\b", low))),
+        ("样品", bool(re.search(r"\bsample[s]?\b", low))),
+    ]
+    provided = [label for label, ok in checks if ok]
+    missing = [label for label, ok in checks if not ok]
+    score = len(provided)
+
+    if not (bool(phrase or has_match) or specs) or not (info.get("quantity") or _vague):
+        level = COMPLETENESS_LOW
+    elif score >= 9:
+        # TEST03：完整度衡量“客户把需求说得多清楚”。产品/数量/规格/定制/包装/交期/
+        # 样品/目的地/价格齐备的 RFQ 即使没提认证/贸易术语/付款方式，也属高完整度
+        # （那三项是可后补的商务条款，不应把高完整度 RFQ 降为中）。
+        level = COMPLETENESS_HIGH
+    elif score >= 6:
+        level = COMPLETENESS_MEDIUM
+    else:
+        level = COMPLETENESS_LOW
+    return {
+        "level": level,
+        "level_cn": COMPLETENESS_CN[level],
+        "score": score,
+        "total": len(checks),
+        "provided": provided,
+        "missing": missing,
+        "basis": (f"客户侧需求信息已提供 {score}/{len(checks)} 项"
+                  f"（产品方向/数量齐全 → 需求完整性与内部产品匹配相互独立）"),
+    }
+
+
+def summarize_product_match(text: str, info: dict, matches: list) -> dict:
+    """产品匹配状态（与 reply_strategy.detect_match_state 同口径的汇总）。"""
+    info = info or {}
+    matches = matches or []
+    phrase = extract_customer_product(text) or _norm(info.get("product_query"))
+    strong = [m for m in matches
+              if m.get("hit_keywords") or (m.get("match_score") or 0) >= 0.5]
+    candidates = [m for m in matches
+                  if m.get("hit_keywords") or (m.get("match_score") or 0) >= 0.25]
+    has_spec = has_customer_spec_signal(text) or bool(extract_customer_specs(text))
+    if strong:
+        state = PRODUCT_MATCH_MATCHED
+    elif candidates:
+        state = PRODUCT_MATCH_PARTIAL
+    elif phrase or has_spec:
+        state = PRODUCT_MATCH_UNRESOLVED
+    else:
+        state = PRODUCT_MATCH_INSUFFICIENT
+
+    # TEST03：结构化三元组（客户侧需求 vs 库内匹配 vs 我方供应能力），全部只读派生。
+    #   - 客户明确品类 + 库内无候选 → OUT_OF_CATALOG（真实商机，非低质线索）
+    #   - 客户连品类都没说 + 库内无匹配 → 先问产品方向（INSUFFICIENT 老口径）
+    #   - supplier capability 在库内匹配前一律 UNKNOWN（待内部确认，不写死失败）
+    if state == PRODUCT_MATCH_MATCHED:
+        match_class, opp_class, supplier = PRODUCT_MATCH_MATCHED, IN_CATALOG, SUPPLIER_CAPABLE
+    elif state == PRODUCT_MATCH_PARTIAL:
+        match_class, opp_class, supplier = PRODUCT_MATCH_PARTIAL, IN_CATALOG, SUPPLIER_UNKNOWN
+    elif state == PRODUCT_MATCH_UNRESOLVED and phrase:
+        match_class, opp_class, supplier = PRODUCT_MATCH_NO_MATCH, OUT_OF_CATALOG, SUPPLIER_UNKNOWN
+    elif state == PRODUCT_MATCH_UNRESOLVED:
+        match_class, opp_class, supplier = PRODUCT_MATCH_NO_MATCH, OUT_OF_CATALOG, SUPPLIER_UNKNOWN
+    else:
+        match_class, opp_class, supplier = PRODUCT_MATCH_INSUFFICIENT, CUSTOMER_PRODUCT_UNKNOWN, SUPPLIER_UNKNOWN
+
+    return {
+        "status": state,
+        "status_cn": PRODUCT_MATCH_CN[state],
+        "customer_product": phrase,
+        "specs": extract_customer_specs(text),
+        "candidates": [m.get("name") for m in candidates[:3] if m.get("name")],
+        # ---- TEST03 新字段（仅展示/商机分类，不改评分）----
+        "product_match_status": match_class,     # MATCHED / PARTIAL_MATCH / NO_MATCH / INSUFFICIENT_INFORMATION
+        "customer_product_state": (CUSTOMER_PRODUCT_KNOWN if phrase
+                                   else (CUSTOMER_PRODUCT_KNOWN if has_spec
+                                         else CUSTOMER_PRODUCT_UNKNOWN)),
+        "opportunity_type": opp_class,           # IN_CATALOG / OUT_OF_CATALOG / CUSTOMER_PRODUCT_UNKNOWN
+        "opportunity_type_cn": (OUT_OF_CATALOG_CN if opp_class == OUT_OF_CATALOG
+                                else ("现有产品线机会" if opp_class == IN_CATALOG
+                                      else "产品方向待明确")),
+        "supplier_capability_status": supplier,  # CAPABLE / UNKNOWN
+        "supplier_capability_label": ("具备（库内有对应产品）"
+                                      if supplier == SUPPLIER_CAPABLE else "待确认"),
+    }
+
+
+def build_ai_summary(text: str, info: dict, matches: list, cert: dict = None,
+                     product_match: dict = None) -> str:
+    """AI 摘要：1-2 行，只回答 Who / What / How much / When，不重复整份分析。
+
+    Round 2 TEST01：摘要不再承担"详细分析报告"职能——详细内容走渐进披露。
+    """
+    info = info or {}
+    text = text or ""
+    low = text.lower()
+    phrase = extract_customer_product(text) or _norm(info.get("product_query"))
+    qty = info.get("quantity")
+    qty_txt = ""
+    if qty:
+        qty_txt = f"{qty:,} {info.get('quantity_unit') or 'pcs'}"
+    elif _vague_quantity_fragments(text):
+        qty_txt = _vague_quantity_fragments(text)[0]
+
+    # 目标价：优先展示原文区间 USD 8.50 - 9.50，退化为单值
+    pr = re.search(r"(?:usd|us\$|\$)\s*(\d+(?:\.\d+)?)\s*(?:[-–~]\s*(\d+(?:\.\d+)?))?",
+                   text, re.I)
+    price_txt = ""
+    if info.get("target_price"):
+        if pr and pr.group(2):
+            price_txt = f"USD {pr.group(1)}–{pr.group(2)}"
+        else:
+            price_txt = f"USD {info['target_price']}"
+    elif pr:
+        price_txt = f"USD {pr.group(1)}" + (f"–{pr.group(2)}" if pr.group(2) else "")
+
+    buyer = []
+    if info.get("country"):
+        buyer.append(info["country"])
+    if info.get("company"):
+        buyer.append(info["company"])
+    who = ("客户" if not buyer else
+           ("、".join(buyer) if len(buyer) == 1 else f"{buyer[0]} {buyer[1]}"))
+
+    req_flags = []
+    cert = cert or certify_split(text)
+    if _has_cert_mention(cert):
+        req_flags.append("CE/RoHS 类认证要求" if cert["certification_status"] == CERT_REQUIRED
+                         else "关注认证")
+    if re.search(r"\b(custom\w*|logo|oem|odm|print\w*)\b", low):
+        req_flags.append("logo/定制")
+    if re.search(r"\bsample[s]?\b", low):
+        req_flags.append("需样品")
+
+    line1 = f"{who}采购 "
+    line1 += qty_txt or ""
+    if phrase:
+        line1 += (" " if qty_txt else "") + phrase
+    elif matches:
+        line1 += (" " if qty_txt else "") + matches[0]["name"]
+    else:
+        line1 += "相关产品"
+    if price_txt:
+        line1 += f"，目标价 {price_txt}"
+    if req_flags:
+        line1 += f"，要求 {'、'.join(req_flags)}"
+
+    # When：样品确认后 30 天 / 24 小时内报价 这类时间线
+    line2 = ""
+    sm = re.search(r"\b(?:within|in)\s+\d+\s+(?:days?|weeks?|months?)\s+"
+                   r"(?:after|following)\s+(?:the\s+)?sample\s+approval\b", text, re.I)
+    if sm:
+        line2 = f"计划{re.sub(r'\s+', ' ', sm.group(0))}下首批订单。"
+    elif info.get("quantity") and re.search(r"\bwithin\s+\d+\s+(?:days?|weeks?)\b", low):
+        dm = re.search(r"\bwithin\s+\d+\s+(?:days?|weeks?)\b", low)
+        line2 = f"要求在 {dm.group(0)} 内推进。"
+    pm = product_match or summarize_product_match(text, info, matches)
+    if pm.get("status") == PRODUCT_MATCH_UNRESOLVED:
+        line2 += "产品库暂无对应 SKU——优先内部选型并准备初步报价（不向客户退回完整性问题）。"
+    elif pm.get("status") == PRODUCT_MATCH_INSUFFICIENT:
+        line2 += "当前缺产品方向，需先向客户确认品类。"
+    summary = line1 + "。" + (f"{line2}" if line2 else "")
+    return summary
+
+
+
 # ---------- 报价准备度：十项因素 + A/B/C 确认项分级（第三轮优化一、二、八） ----------
 # A = 必须确认项（未确认 → 不能"可正式报价"；产品/数量完全没着落 → 连初步报价都不行）
 # B = 建议确认项（未确认 → 可初步报价，正式报价前最好确认）
@@ -666,6 +950,12 @@ def _factor_state(key: str, text: str, info: dict, matches: list,
 
     if key == "quantity":
         if info.get("quantity") and "quantity" not in partial_fields:
+            rev = info.get("quantity_revision") or {}
+            if rev.get("current") is not None and rev.get("previous") is not None:
+                return "confirmed", (
+                    f"客户明确将当前数量调整为 {int(rev['current']):,} "
+                    f"{rev.get('unit') or 'pcs'}（由 {int(rev['previous']):,} "
+                    f"{rev.get('unit') or 'pcs'} 调整）→ 数量明确，不构成冲突")
             # 多数量语义补丁：询盘里有多个数量时，逐个标注商业语义，
             # 说明它们各归各位、不构成冲突（避免 AI 摘要制造虚假数量冲突）
             sems = info.get("quantity_semantics") or []
@@ -689,6 +979,11 @@ def _factor_state(key: str, text: str, info: dict, matches: list,
         if has_match:
             return "confirmed", (f"产品库已匹配到具体产品「{matches[0]['name']}」"
                                  "（含价格/MOQ/常规参数），客户未提出未被覆盖的规格变化 → 规格可按匹配 SKU 定")
+        # Round 2 TEST01：客户已给出规格信号（尺寸/容量/材质/电子参数如
+        # Bluetooth/ANC/USB-C/battery hours）→ 规格由客户明确，属"已确认"，
+        # 不是"未提及"；库内选型核对是内部动作，不再生成客户侧规格追问。
+        if has_customer_spec_signal(text):
+            return "confirmed", "客户明确给出规格信号（尺寸/容量/材质/电子参数）→ 规格由客户确认，下一步做内部选型核对"
         if product_query:
             return "partially_confirmed", "客户描述了产品但库内无精确匹配，具体规格需人工核对 → 部分明确"
         return "unknown", "产品与规格均未提及 → 规格不明确"
@@ -1003,6 +1298,7 @@ ACTION_CN = {
     "ask_for_information": "追问关键信息",
     "prepare_preliminary_quote": "准备初步报价",
     "prepare_formal_quote": "准备正式报价",
+    "match_closest_product": "匹配最接近 SKU（内部选型）",
     "recommend_products": "推荐产品",
     "send_reply": "发送回复",
     "follow_up": "后续跟进",
@@ -1072,10 +1368,22 @@ def build_next_actions(readiness: dict, text: str, info: dict, matches: list,
             "关键信息已齐全，可以直接进入正式报价。",
             related_field=None, deadline="immediately"))
     elif status == STATUS_PRELIM:
-        actions.append(_act(
-            "prepare_preliminary_quote", "P1",
-            "产品和数量方向已明确，可先准备初步报价 / 价格区间。",
-            related_field=None, deadline="within 24h"))
+        _phrase_known_nomatch = bool(
+            not matches and (customer_product_phrase(text)
+                             or _norm(info.get("product_query"))))
+        if not _phrase_known_nomatch:
+            actions.append(_act(
+                "prepare_preliminary_quote", "P1",
+                "产品和数量方向已明确，可先准备初步报价 / 价格区间。",
+                related_field=None, deadline="within 24h"))
+        else:
+            # Round 2 TEST01：客户需求完整但库内无对应 SKU → 内部选型先行，
+            # 报价准备是选型完成后的下一步（不在 P1，避免向客户退回完整性问题）。
+            actions.append(_act(
+                "prepare_preliminary_quote", "P2",
+                "完成最接近 SKU 的内部选型后即可准备初步报价（内部匹配先行，"
+                "不把产品库缺口当成客户信息缺口退回）。",
+                related_field=None, deadline="after internal matching"))
     # 候选规格（容量/尺寸）未定 → 单独一条可执行的确认动作
     # 第五轮第二次补丁 03：vals 跨 capacity/size/specification 三个字段取，
     # 修复「客户在『』之间未定」候选值显示为空的 bug
@@ -1104,25 +1412,21 @@ def build_next_actions(readiness: dict, text: str, info: dict, matches: list,
             "客户有明确认证要求，需核对产品能否满足后再正式报价。",
             related_field="certification", deadline="before formal quotation"))
 
-    # 未匹配到产品 → 按产品层级区分下一步（第五轮第二次补丁 03）：
-    #   品类已明确 → 下一步是"查看产品库并匹配候选产品"（内部动作，P2，不升 P0，
-    #                也绝不向客户反问"要什么产品类别"）；
-    #   品类未知   → 才需要向客户索取产品方向（图片 / 链接 / 型号）。
-    if not matches and not _norm(info.get("product_query")):
-        _phrase_act = customer_product_phrase(text)
-        if _phrase_act:
+    # Round 2 TEST01：未匹配到产品 ≠ 客户信息缺口。
+    # 客户已明确产品方向 → 最高优先动作是"内部匹配最接近 SKU"（P1，自我解决）；
+    # 只有客户连产品方向都没给（真·客户信息缺口）才需要向客户索取。
+    if not matches:
+        _phrase_match_act = customer_product_phrase(text) or _norm(info.get("product_query"))
+        if _phrase_match_act:
             actions.append(_act(
-                "recommend_products", "P2",
-                f"客户已明确产品品类「{_phrase_act}」→ 查看产品库并匹配候选产品"
-                "（检索该品类 / 相近品类），匹配不上再请客户提供参考型号 / 图片；"
-                "品类已确认，不需要向客户确认产品类别。",
-                related_field="product", deadline="before preliminary quote"))
-        else:
-            actions.append(_act(
-                "recommend_products", "P2",
-                "当前产品库未找到匹配产品（如实提示）——先向客户索取产品图片 / 链接 / 型号，"
-                "再人工判断产品库中是否有可替代品类，而不是编造产品报价。",
-                related_field="product", deadline="before any quote"))
+                "match_closest_product", "P1",
+                f"查看产品库并匹配候选产品：客户已明确产品「{_phrase_match_act}」，"
+                "但产品库暂无对应 SKU——先内部检索该品类 / 相近品类的候选产品并锁定"
+                "最接近配置，再据此准备初步报价；只有当内部检索确实需要参考型号 / 图片 / "
+                "设计时，才在邮件中附带 1 个问题。",
+                related_field="product", deadline="before quotation"))
+        # 无产品方向的情况已由 prelim_hard 的 request_product_detail（P0）承担，
+        # 此处不重复追加"向客户索取图片/链接"的 P2 动作。
 
     # P3 · 发送回复（第一封）
     actions.append(_act(
@@ -1189,13 +1493,19 @@ def tag_data_sources(text: str, info: dict, matches: list) -> dict:
     info = info or {}
     customer = []
     if info.get("quantity"):
-        # 多数量语义补丁：多数量时逐个标注商业语义（报价数量/试单/潜在订单量）
-        sems = info.get("quantity_semantics") or []
-        if len(sems) > 1:
-            customer.append("；".join(f"{s['role_cn']} {s['value']:,}"
-                                      for s in sems[:4]))
+        rev = info.get("quantity_revision") or {}
+        if rev.get("current") is not None and rev.get("previous") is not None:
+            customer.append(
+                f"当前数量 {int(rev['current']):,} {rev.get('unit') or 'pcs'}"
+                f"（由 {int(rev['previous']):,} {rev.get('unit') or 'pcs'} 调整）")
         else:
-            customer.append(f"采购数量 {info['quantity']:,}")
+        # 多数量语义补丁：多数量时逐个标注商业语义（报价数量/试单/潜在订单量）
+            sems = info.get("quantity_semantics") or []
+            if len(sems) > 1:
+                customer.append("；".join(f"{s['role_cn']} {s['value']:,}"
+                                          for s in sems[:4]))
+            else:
+                customer.append(f"采购数量 {info['quantity']:,}")
     if info.get("country"):
         customer.append(f"目的地 {info['country']}")
     if info.get("company"):
@@ -1371,6 +1681,18 @@ def build_insight(text: str, info: dict, matches: list, lead: dict,
     requirement_semantics = build_requirement_semantics(req_status, partially,
                                                         info, matches)
 
+    # Round 2 TEST01：需求完整性（客户侧）与产品匹配（供应侧）分开呈现，
+    # 互不拉低；并提供 1-2 行 AI 摘要（详细推理走渐进披露，不重复堆叠）。
+    completeness = assess_requirement_completeness(text, info, matches, cert)
+    product_match = summarize_product_match(text, info, matches)
+    ai_summary = build_ai_summary(text, info, matches, cert, product_match)
+    _qr_ui_alias = {
+        STATUS_INSUFFICIENT: "NOT_READY",
+        STATUS_PRELIM: "PARTIALLY_READY",
+        STATUS_READY: "READY_FOR_QUOTE",
+        STATUS_QUOTED: "QUOTED",
+    }
+
     return {
         "inquiry": req_status,                    # 需求字段三态评估
         "product_hierarchy": product_hierarchy,   # Category→Type→Model→Spec→Final Selection
@@ -1379,6 +1701,12 @@ def build_insight(text: str, info: dict, matches: list, lead: dict,
         "certification": cert,                     # 四态认证（required/requested/interested/unknown）
         "certification_status": cert["certification_status"],   # 便捷顶层字段
         "quotation_readiness": readiness,          # 准备度 v3：四级状态 + 十因素 + A/B/C 分级
+        "quotation_readiness_alias": _qr_ui_alias.get(
+            normalize_status(readiness.get("quotation_readiness_status", "")),
+            "NOT_READY"),                          # Round 2：NOT_READY/PARTIALLY_READY/READY_FOR_QUOTE
+        "requirement_completeness": completeness,  # Round 2：需求完整性（客户侧，HIGH/MED/LOW）
+        "product_match": product_match,            # Round 2：产品匹配（供应侧，独立维度）
+        "ai_summary": ai_summary,                  # Round 2：1-2 行摘要（Who/What/How much/When）
         "risks": risks,                            # 事实型风险
         "next_actions": next_actions,              # 下一步动作（结构化，可执行）
         "product_matching_note": product_note,

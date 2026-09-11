@@ -29,11 +29,13 @@ import re
 
 from agent.extractor import (
     extract_quantity_semantics, semantic_conflict_roles,
+    extract_customer_product, extract_customer_specs,
+    has_customer_spec_signal,
     QUANTITY_QUOTATION,
 )
 from agent.insight import (
     find_open_options, certify_split, normalize_status,
-    STATUS_INSUFFICIENT, STATUS_PRELIM, CERT_REQUIRED,
+    STATUS_INSUFFICIENT, STATUS_PRELIM, STATUS_READY, CERT_REQUIRED,
 )
 
 def _quantity_values_in_hedge_context(text: str, vals: list) -> dict:
@@ -97,6 +99,204 @@ TIER_CN = {
     "P1": "P1 · 后续报价/打样/订单阶段确认",
     "P2": "P2 · 边谈边补（首轮不问）",
 }
+
+Q_BLOCKING = "BLOCKING"
+Q_NON_BLOCKING = "NON_BLOCKING"
+Q_PROFILE_ONLY = "PROFILE_ONLY"
+
+# ============ Round 2 / TEST02：Minimum Information To Advance ============
+# UNKNOWN ≠ 自动 ASK。任何未知字段都要先归到销售阶段 → 看下一步动作 →
+# 判断该字段是否阻塞此动作 → 只在必要时才问。
+# 这套阶段/时机分级与既有 P0/P1/P2 + BLOCKING/NON_BLOCKING/PROFILE_ONLY
+# 是同一套口径的两个投影：P0→BLOCKING/ASK_NOW，P1→NON_BLOCKING/ASK_LATER，
+# P2→PROFILE_ONLY/DO_NOT_ASK。不新增重复的字段体系。
+
+# ---- 销售阶段（spec TEST02 §4）----
+STAGE_NEW_INQUIRY = "NEW_INQUIRY"                  # 新询盘：先完成产品匹配（品类/核心规格/数量）
+STAGE_INDICATIVE = "INDICATIVE_QUOTATION"          # 已匹配 → 意向报价
+STAGE_FORMAL = "FORMAL_QUOTATION"                  # 意向 → 正式报价
+STAGE_SAMPLE = "QUOTATION_TO_SAMPLE"               # 报价 → 样品
+STAGE_NEGOTIATION = "NEGOTIATION_TO_PO"            # 谈判 → PO
+STAGE_QUOTED = "QUOTED"                            # 已报价 / 终态前置
+
+SALES_STAGE_CN = {
+    STAGE_NEW_INQUIRY: "新询盘 · 产品匹配",
+    STAGE_INDICATIVE: "意向报价（产品已匹配）",
+    STAGE_FORMAL: "正式报价",
+    STAGE_SAMPLE: "报价→样品",
+    STAGE_NEGOTIATION: "谈判→PO",
+    STAGE_QUOTED: "已报价",
+}
+
+# ---- 询问时机（spec TEST02 §2/§5）----
+ASK_NOW = "ASK_NOW"          # 当前动作被它阻塞，必须现在问
+ASK_LATER = "ASK_LATER"      # 后续阶段才影响，现在不问
+DO_NOT_ASK = "DO_NOT_ASK"    # 档案/渠道类，不阻塞，不主动索取
+
+ASK_CN = {
+    ASK_NOW: "现在问（阻塞当前下一步）",
+    ASK_LATER: "以后问（当前不阻塞）",
+    DO_NOT_ASK: "不问（档案/渠道类）",
+}
+
+# 字段 → 默认时机（产品匹配阶段）。阶段推进时用 _STAGE_OVERRIDES 前移。
+_ASK_DEFAULT = {
+    # --- 阻塞/现在问：识别产品与报价档位必需 ---
+    "product_category": ASK_NOW, "product_type": ASK_NOW,
+    "product_spec": ASK_NOW, "specification": ASK_NOW,
+    "reference_model": ASK_NOW, "model_selection": ASK_NOW,
+    "candidate_confirm": ASK_NOW, "open_option": ASK_NOW,
+    "quantity_conflict": ASK_NOW, "quantity_confirm": ASK_NOW,
+    # --- 以后问：会影响报价/打样/订单，但不是当前产品匹配的前置 ---
+    "customization": ASK_LATER, "certification": ASK_LATER,
+    "destination": ASK_LATER, "delivery": ASK_LATER,
+    "delivery_time": ASK_LATER, "packaging": ASK_LATER,
+    "payment": ASK_LATER, "payment_terms": ASK_LATER,
+    "incoterm": ASK_LATER, "quantity": ASK_LATER,   # 视意图覆盖（RFQ→ASK_NOW）
+    # --- 档案/渠道类：绝不主动索要 ---
+    "email": DO_NOT_ASK, "company": DO_NOT_ASK, "target_price": DO_NOT_ASK,
+    "company_scale": DO_NOT_ASK, "annual_volume": DO_NOT_ASK,
+    "sales_channel": DO_NOT_ASK, "competitor": DO_NOT_ASK,
+    "purchase_cycle": DO_NOT_ASK, "website": DO_NOT_ASK,
+    "linkedin": DO_NOT_ASK, "contact_phone": DO_NOT_ASK,
+    "explicit_request_response": DO_NOT_ASK,
+}
+
+# 阶段推进时把后置字段前移为 ASK_NOW（只写"前移"，其余沿用默认）
+_STAGE_OVERRIDES = {
+    STAGE_INDICATIVE: {"quantity": ASK_NOW, "destination": ASK_NOW,
+                       "incoterm": ASK_NOW},
+    STAGE_FORMAL: {"quantity": ASK_NOW, "destination": ASK_NOW,
+                   "incoterm": ASK_NOW, "customization": ASK_NOW,
+                   "packaging": ASK_NOW, "certification": ASK_LATER},
+    STAGE_SAMPLE: {"quantity": ASK_NOW, "destination": ASK_NOW},
+    STAGE_NEGOTIATION: {"payment": ASK_NOW, "payment_terms": ASK_NOW,
+                        "incoterm": ASK_NOW, "delivery": ASK_NOW,
+                        "delivery_time": ASK_NOW, "packaging": ASK_NOW},
+}
+
+# 每阶段"推进到下一步需要的信息"（spec TEST02 §4 Minimum Information To Advance）
+_STAGE_ADVANCE_FIELDS = {
+    STAGE_NEW_INQUIRY: ["产品方向（品类/类型）", "核心规格（容量/尺寸/参考型号）", "数量"],
+    STAGE_INDICATIVE: ["已匹配 SKU/产品", "数量", "与价格相关的配置", "报价口径（按需）"],
+    STAGE_FORMAL: ["精确 SKU", "定制", "包装", "贸易术语", "目的地", "商务条款"],
+    STAGE_SAMPLE: ["样品 SKU", "样品数量", "收货地址", "快递安排"],
+    STAGE_NEGOTIATION: ["最终价格", "付款方式", "交期", "包装", "运输条款", "合同条款"],
+}
+
+# 问题排序权重（spec TEST02 §5）：
+#   业务影响 + 阻塞严重度 + 信息增益 − 客户摩擦
+_ASK_WEIGHT = {
+    "product_category": 32, "product_type": 31, "product_spec": 31,
+    "reference_model": 30, "specification": 30, "open_option": 29,
+    "model_selection": 28, "candidate_confirm": 28, "quantity_conflict": 27,
+    "quantity": 26, "quantity_confirm": 24, "delivery": 16,
+    "certification": 14, "destination": 15, "customization": 12,
+    "incoterm": 12, "payment": 10, "packaging": 9,
+    "email": 3, "company": 3, "target_price": 6,
+    "company_scale": 2, "annual_volume": 3, "sales_channel": 3,
+    "competitor": 3, "purchase_cycle": 2,
+}
+_DEFAULT_ASK_WEIGHT = 12
+_EMAIL_SOURCE_RE = re.compile(r"[\w\.\-]+@[\w\-]+\.\w+", re.I)
+
+
+def _field_alias(field: str) -> str:
+    """把各处的字段叫法归一，避免重复体系。"""
+    f = str(field or "")
+    return {"delivery_time": "delivery", "payment_terms": "payment",
+            "product_type": "product_type", "model": "reference_model"}.get(f, f)
+
+
+def infer_sales_stage(product=None, matches=None, insight=None,
+                      readiness_status: str = "", intent: str = "") -> str:
+    """根据当前证据推断销售阶段（规则版，不引入新状态机）。
+
+    仅用于决定"现在该不该问某字段"；与 InquiryStatus / DealStage 状态机无关。
+    """
+    qr_status = normalize_status(readiness_status or "")
+    matched = (product is not None) or any(
+        m.get("hit_keywords") or (m.get("match_score") or 0) >= 0.5
+        for m in (matches or []))
+    if not matched:
+        stage = STAGE_NEW_INQUIRY
+    else:
+        stage = STAGE_FORMAL if qr_status == STATUS_READY \
+            else STAGE_INDICATIVE
+    return stage
+
+
+def minimum_info_to_advance(stage: str) -> dict:
+    """当前阶段推进到下一步所需信息清单（用于口径说明，不生成问题）。"""
+    stage = stage or STAGE_NEW_INQUIRY
+    return {
+        "stage": stage,
+        "stage_cn": SALES_STAGE_CN.get(stage, stage),
+        "required_for_next_action": _STAGE_ADVANCE_FIELDS.get(
+            stage, _STAGE_ADVANCE_FIELDS[STAGE_NEW_INQUIRY]),
+        "next_action": {
+            STAGE_NEW_INQUIRY: "完成产品匹配（品类/规格/数量 → 初步报价）",
+            STAGE_INDICATIVE: "给出意向报价（价格区间）",
+            STAGE_FORMAL: "给出正式报价",
+            STAGE_SAMPLE: "安排打样/样品",
+            STAGE_NEGOTIATION: "推进到 PO / 合同",
+        }.get(stage, "推进商机"),
+    }
+
+
+def classify_ask(field: str, stage: str = STAGE_NEW_INQUIRY,
+                 *, intent: str = "", has_quantity: bool = False,
+                 has_email: bool = False, text: str = "") -> dict:
+    """UNKNOWN → 阶段 → 下一步动作 → 是否阻塞 → 该不该现在问。
+
+    返回 {"ask": ASK_NOW/ASK_LATER/DO_NOT_ASK, "ask_cn": ..., "reason": ...}
+    这是 gapcheck 缺失项与回复追问计划的**共同分类器**，避免两套判定漂移。
+    """
+    stage = stage or STAGE_NEW_INQUIRY
+    key = _field_alias(field)
+    timing = _ASK_DEFAULT.get(key, ASK_LATER)
+    # 阶段推进覆盖
+    for ov_stage in (stage,):
+        timing = _STAGE_OVERRIDES.get(ov_stage, {}).get(key, timing)
+
+    low = (text or "").lower()
+    asks_price = bool(re.search(r"\b(quote|quotation|best\s+price|price\s+list|moq)\b", low))
+    # 纯 Catalog / 样品请求才算 request_first；一旦意图已知（RFQ 等）以意图为准，
+    # 避免 "send catalog AND best price" 这类混合询盘被当成纯目录请求而跳过数量
+    if intent in (INTENT_CATALOG, INTENT_SAMPLE):
+        request_first = True
+    elif intent:
+        request_first = False
+    else:
+        request_first = (bool(re.search(r"\b(catalog|catalogue)\b", low))
+                         or bool(re.search(r"\bsamples?\b", low))) and not asks_price
+    intent_rfq = intent == INTENT_RFQ or (intent == "" and asks_price)
+
+    # 数量：报价/价格类询问需要数量；纯 Catalog/Sample 请求不需要
+    if key == "quantity":
+        timing = ASK_NOW if (intent_rfq and not request_first and not has_quantity) \
+            else ASK_LATER
+    # 邮箱：渠道感知（Test01 已确立）——邮件渠道且已回即可达 → 不问；
+    # 非邮件渠道只有在需要正式文件/报价交付时才要
+    if key == "email":
+        if has_email:
+            timing = DO_NOT_ASK
+        elif stage in (STAGE_FORMAL, STAGE_SAMPLE, STAGE_NEGOTIATION):
+            timing = ASK_NOW
+        else:
+            timing = DO_NOT_ASK
+
+    _reason = {
+        ASK_NOW: "该字段阻塞当前下一步动作，需要现在问",
+        ASK_LATER: "属于后续阶段信息，现在问会像填 CRM 表格，先不索取",
+        DO_NOT_ASK: "档案/渠道类信息，不阻塞商机推进，不主动索取",
+    }
+    return {
+        "ask": timing,
+        "ask_cn": ASK_CN[timing],
+        "reason": _reason[timing],
+        "stage": stage,
+    }
 
 # ---------- 客户明确提出的需求（回复优先级高于追问） ----------
 _REQUEST_PATTERNS = [
@@ -193,6 +393,25 @@ def _fmt(n):
         return f"{int(n):,}"
     except Exception:
         return str(n)
+
+
+def _question_class(field: str) -> str:
+    if field in ("email", "company", "website", "linkedin", "company_scale",
+                 "sales_channel", "competitor", "purchase_cycle"):
+        return Q_PROFILE_ONLY
+    if field in ("reference_model", "product_category", "candidate_confirm",
+                 "model_selection", "specification", "quantity",
+                 "quantity_conflict", "delivery_definition"):
+        return Q_BLOCKING
+    if field in ("explicit_request_response",):
+        return Q_NON_BLOCKING
+    return Q_NON_BLOCKING
+
+
+def _with_class(q: dict) -> dict:
+    q = dict(q or {})
+    q["question_class"] = _question_class(q.get("field") or "")
+    return q
 
 
 # ===================== 1. 提问计划 =====================
@@ -373,32 +592,16 @@ def customer_product_phrase(text: str) -> str:
 
     例："We are interested in Stainless Steel Water Bottle, 500ml or 750ml"
         → "Stainless Steel Water Bottle"
+    Round 2 TEST01：委托 agent.extractor.extract_customer_product（统一口径），
+    支持 "place an order for 5,000 pcs of Wireless ANC Earbuds" 等常见写法。
     只回客户原话，绝不猜测、绝不补全。
     """
-    for m in _OBJECT_RE.finditer(text or ""):
-        raw = re.split(r"[,.;:\n]|\b(?:for|with|and|or|in|at|to|of|from)\b",
-                       m.group(1), maxsplit=1)[0]
-        raw = _norm(raw).strip(" ,.-")
-        # 第五轮第二次补丁 03：去掉引导冠词/物主代词（与 insight.customer_product_phrase
-        # 同源）——"your Stainless Steel Water Bottle" → "Stainless Steel Water Bottle"
-        raw = re.sub(r"^(?:your|our|the|a|an|some|own)\s+", "", raw,
-                     flags=re.I).strip(" ,.-")
-        if not raw or _GENERIC_OBJECT_RE.match(raw):
-            continue
-        if len(raw.split()) > 6:
-            raw = " ".join(raw.split()[:6])
-        return raw
-    return ""
+    return extract_customer_product(text)
 
 
 def spec_tokens(text: str) -> list:
-    """客户原文里出现的规格词（容量/尺寸/重量），用于"确认已理解需求"。"""
-    out = []
-    for m in _SPEC_TOKEN_RE.finditer(text or ""):
-        v = re.sub(r"\s+", "", m.group(0)).lower()
-        if v not in out:
-            out.append(v)
-    return out[:3]
+    """客户原文里出现的规格词（容量/尺寸/重量/电子规格），用于"确认已理解需求"。"""
+    return extract_customer_specs(text)
 
 
 def detect_match_state(text: str, info: dict, product, matches=None) -> dict:
@@ -418,7 +621,8 @@ def detect_match_state(text: str, info: dict, product, matches=None) -> dict:
                   if m.get("hit_keywords") or (m.get("match_score") or 0) >= 0.25]
     phrase = customer_product_phrase(text) or _norm(info.get("product_query"))
     specs = spec_tokens(text)
-    has_spec = bool(specs) or bool(_MATERIAL_RE.search(text or ""))
+    has_spec = bool(specs) or bool(_MATERIAL_RE.search(text or "")) \
+        or has_customer_spec_signal(text)
 
     if product or strong:
         state = MATCH_MATCHED
@@ -480,6 +684,15 @@ def build_question_plan(text: str, info: dict, product, insight: dict = None,
     state = mstate["state"]
     phrase = mstate["customer_product"]
     specs = mstate["specs"]
+
+    # ---- Round 2 / TEST02：Minimum Information To Advance ----
+    # 先归到销售阶段，再决定每个未知字段是现在问 / 以后问 / 不问。
+    advance_stage = infer_sales_stage(
+        product, matches, insight,
+        readiness_status=(qr or {}).get("quotation_readiness_status", ""),
+        intent=intent)
+    _has_email_known = bool(info.get("email")) or bool(
+        re.search(r"[\w\.\-]+@[\w\-]+\.\w+", text or ""))
 
     # ---- P0-0 客户当前明确要求（第五轮第三次优化 §八：显式客户请求优先级最高） ----
     if request_first:
@@ -720,18 +933,47 @@ def build_question_plan(text: str, info: dict, product, insight: dict = None,
             "question": "（首轮禁止提问）",
         })
 
-    # ---- 限流选取：硬 P0 优先，软确认项只在有余量时补 ----
-    # 第五轮第三次优化：问题预算按意图调整（CATALOG/SAMPLE 0-1 问，RFQ ≤3）
-    hard_p0 = [q for q in p0 if not q.get("soft")]
-    soft_p0 = [q for q in p0 if q.get("soft")]
+    # ---- Round 2 / TEST02：为每个候选标注 ASK_NOW / ASK_LATER / DO_NOT_ASK ----
+    # 时机与分级共用同一字段判定（classify_ask），避免两套口径漂移。
+    def _decorate(q):
+        q = dict(q or {})
+        _c = classify_ask(q.get("field") or "", advance_stage,
+                          intent=intent, has_quantity=bool(info.get("quantity")),
+                          has_email=_has_email_known, text=text)
+        q["ask_timing"] = _c["ask"]
+        q["ask_timing_cn"] = _c["ask_cn"]
+        q["ask_reason"] = _c["reason"]
+        q["ask_stage"] = advance_stage
+        q["ask_score"] = _ASK_WEIGHT.get(_field_alias(q.get("field") or ""),
+                                         _DEFAULT_ASK_WEIGHT)
+        return q
+
+    p0 = [_with_class(_decorate(q)) for q in p0]
+    p1 = [_with_class(_decorate(q)) for q in p1]
+    p2 = [_with_class(_decorate(q)) for q in p2]
+    hard_p0 = [q for q in p0 if not q.get("soft")
+               and q.get("question_class") == Q_BLOCKING]
+    soft_p0 = [q for q in p0 if q.get("soft")
+               and q.get("question_class") == Q_BLOCKING]
+
+    def _ranked(items):
+        # 排序：ASK_NOW 优先；同级内按业务影响/信息增益分排序（排序稳定）
+        return sorted(items, key=lambda q: (q.get("ask_timing") != ASK_NOW,
+                                            -int(q.get("ask_score") or 0)))
+
     if request_first:
         # 客户当前明确请求优先响应（P0 动作项不进问句）；
         # 唯一允许的首轮问题 = 聚焦品类的 P1 问题（预算 0-1 个）
-        selected = [q for q in p1 if q.get("ask_in_first_reply")][:intent_budget]
+        selected = _ranked(
+            [q for q in p1 if q.get("ask_in_first_reply")
+             and q.get("question_class") == Q_BLOCKING
+             and q.get("ask_timing") == ASK_NOW])[:intent_budget]
     else:
-        selected = hard_p0[:intent_budget]
+        ask_now_p0 = _ranked(
+            [q for q in hard_p0 if q.get("ask_timing") == ASK_NOW])
+        selected = ask_now_p0[:intent_budget]
         # 默认 1-2：只有硬 P0 真的有 3 个时才用到第 3 个名额
-        if len(selected) > DEFAULT_MAX and len(hard_p0) < MAX_QUESTIONS:
+        if len(selected) > DEFAULT_MAX and len(ask_now_p0) < MAX_QUESTIONS:
             selected = selected[:DEFAULT_MAX]
         # 软确认项（如 "3,000 pcs 是否为首单数量"）：
         #   只有在没有 hard P0 时才附加 —— 否则会淹没真正的阻塞项
@@ -742,7 +984,9 @@ def build_question_plan(text: str, info: dict, product, insight: dict = None,
         #   示例 3：只有一个 hard P0（如 reference_model）+ 数量 vagueness →
         #           不附加软确认 → 仍只问 1 个问题（贴合第五轮补丁 03：单 P0 时 1 问）
         if soft_p0 and not hard_p0 and len(selected) < MAX_QUESTIONS:
-            selected.append(soft_p0[0])
+            _sf = [q for q in soft_p0 if q.get("ask_timing") == ASK_NOW]
+            if _sf:
+                selected.append(_sf[0])
 
     return {
         "match_state": state,
@@ -766,10 +1010,23 @@ def build_question_plan(text: str, info: dict, product, insight: dict = None,
         "quantity_semantics": sem_list,           # 多数量语义补丁
         "quotation_quantity": quotation_qty,      # 客户明确要求报价的数量（无则 None）
         "quantity_conflict_groups": conflict_groups,  # 真冲突角色组（空 = 无冲突）
-        "note": ("首轮回复只问 P0；问题数默认 1-2 个，绝对不超过 "
+        # ---- Round 2 / TEST02：Minimum Information To Advance ----
+        "advance_stage": advance_stage,
+        "advance_stage_cn": SALES_STAGE_CN.get(advance_stage, advance_stage),
+        "minimum_info_to_advance": minimum_info_to_advance(advance_stage),
+        "question_classification": {
+            "blocking": [q for q in p0 if q.get("question_class") == Q_BLOCKING],
+            "non_blocking": [q for q in p1 if q.get("question_class") == Q_NON_BLOCKING],
+            "profile_only": [q for q in (p1 + p2)
+                             if q.get("question_class") == Q_PROFILE_ONLY],
+        },
+        "note": ("首轮回复只问 P0（ASK_NOW）；问题数默认 1-2 个，绝对不超过 "
                  f"{MAX_QUESTIONS} 个。每个问题都要能回答："
                  "「客户不回答，我们下一步是不是真的做不下去？」"
-                 f"（当前意图 {intent}，预算 {intent_budget} 问）"),
+                 f"（当前意图 {intent}，预算 {intent_budget} 问；"
+                 f"销售阶段 {SALES_STAGE_CN.get(advance_stage, advance_stage)}，"
+                 "推进所需 = " + "、".join(minimum_info_to_advance(
+                     advance_stage).get("required_for_next_action") or []) + "）"),
     }
 
 
@@ -1124,6 +1381,27 @@ def validate_reply_strategy(draft: str, text: str, info: dict, product,
     if not product and re.search(r"\byour\s+order\s+of\s+\d", body_low):
         issues.append("产品尚未确认（UNKNOWN），草稿却写「your order of N pcs」"
                       "（把 UNKNOWN 写成了 confirmed fact）")
+
+    # ---- Round 2 TEST01：供应商 Fact Guard 追加 ----
+
+    # ㉓ 未经公司样品政策验证，不得出现 "we can arrange/send samples"、
+    #     "samples are available/free" 等样品承诺（离线环境一律视为无样品政策数据）
+    sample_promise = re.search(
+        r"\b(?:we|i|we'?ll)\s+(?:can\s+|could\s+|will\s+)?(?:arrange|send|provide|dispatch|"
+        r"ship)\s+(?:you\s+)?(?:the\s+|your\s+|some\s+|free\s+)?samples?\b"
+        r"|\b(?:free\s+samples?|samples?\s+(?:are|will\s+be)\s+(?:available|ready|free|"
+        r"complimentary))\b", body_low)
+    if sample_promise:
+        issues.append(f"出现未经公司样品政策验证的样品承诺"
+                      f"「{_norm(sample_promise.group(0))[:70]}」"
+                      "（样品是否可得 / 费用 / 物流需随报价一起确认，不得自动承诺已可安排或免费）")
+
+    # ㉔ 无产品库匹配时，不得把"我们正在给你推荐产品/报价"写成已完成事实
+    if not product and re.search(r"\b(?:we\s+(?:have|'ve)\s+(?:found|matched|selected)|"
+                                 r"your\s+(?:confirmed\s+)?(?:product|model)\s+is)\b",
+                                 body_low):
+        issues.append("产品库无确认匹配，草稿却出现「we have found/matched/selected」类已完成表述"
+                      "（内部匹配尚未完成，只能表达进行中）")
 
     # 去重（保持顺序）
     return list(dict.fromkeys(issues))
