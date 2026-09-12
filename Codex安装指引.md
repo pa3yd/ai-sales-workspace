@@ -78,7 +78,7 @@ codex
 3. 创建 Python 虚拟环境并安装依赖(pip install -r requirements.txt)
 4. 提示我提供 DeepSeek API Key,在项目根目录创建 config.json 并填入
    (模板按 README 的格式,SELLER 部分先留空)
-5. 进入 workbench 目录,执行 streamlit run app.py
+5. 在项目根目录执行 `.venv\\Scripts\\python.exe -m streamlit run workbench\\app.py --server.address 127.0.0.1 --server.port 8501`
 6. 启动成功后告诉我浏览器访问地址
 ```
 
@@ -113,7 +113,7 @@ Codex 会直接改代码并告诉你改了什么。
 ```bash
 git clone https://github.com/pa3yd/ai-sales-workspace.git
 cd ai-sales-workspace && pip install -r requirements.txt
-cd workbench && streamlit run app.py
+.venv\\Scripts\\python.exe -m streamlit run workbench\\app.py --server.address 127.0.0.1 --server.port 8501
 ```
 
 然后在项目根目录手动新建 `config.json`(README「安装与运行」一节有完整模板),填入:
@@ -135,9 +135,9 @@ cd workbench && streamlit run app.py
 | 问题 | 解决办法 |
 |---|---|
 | 启动后 AI 功能报 Key 错误 | 检查 `config.json` 是否在**项目根目录**且 Key 正确;若之前设过 `DEEPSEEK_API_KEY` 环境变量,它优先于 config.json,需重开终端或 `unset` 后再试 |
-| 改了 config.json 不生效 | 重启 streamlit(终端按 `Ctrl+C` 后重新 `streamlit run app.py`) |
+| 改了 config.json 不生效 | 重启 Streamlit（终端按 `Ctrl+C` 后重新执行启动命令） |
 | `git clone` 卡住 / Empty reply | 企业网络常见。先浏览器访问 github.com 确认能通;不行则走代理,或按 hosts 修复教程固定 github.com IP |
-| 8501 端口被占用 | 换端口启动:`streamlit run app.py --server.port 8502`,访问对应地址 |
+| 8501 端口被占用 | 将启动命令的 `--server.port 8501` 改为可用端口，再访问对应地址 |
 | 想带旧数据过去 | 把旧电脑 `workbench/workbench.db` 整个文件拷到新电脑同名位置(该文件不入库,直接覆盖即可) |
 | Key 会不会泄露到 GitHub | 不会。`config.json` 已被 .gitignore 排除,git 不会提交它;也别把 Key 写进任何代码或文档 |
 

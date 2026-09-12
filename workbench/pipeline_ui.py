@@ -6,13 +6,21 @@ import datetime as dt
 import re
 
 import streamlit as st
-from streamlit_sortables import sort_items
 
 import db
+import progression as prog
 import queue_ui as q_ui
 import sales_crm as crm
 
 HEALTH_ICON = {"healthy": "🟢", "attention": "🟡", "at_risk": "🔴", "overdue": "🔴", "closed": "⚪"}
+HEALTH_CN = {"healthy": "健康", "attention": "需关注", "at_risk": "有风险", "overdue": "已逾期"}
+
+# ROUND 7.1 · Pipeline 只消费 Deal Progression Engine 的输出（§2）。
+#   健康度 icon/文案统一来自 progression（三态 HEALTHY/ATTENTION/AT_RISK），
+#   不再在 Pipeline 内自算 healthy/overdue 两套口径。
+PROG_ICON = prog.HEALTH_ICON
+PROG_CN = prog.HEALTH_CN
+
 ACTIVITY_TYPES = ["EMAIL_SENT", "EMAIL_RECEIVED", "CALL", "MEETING", "FOLLOW_UP",
                   "SAMPLE_REQUEST", "SAMPLE_SENT", "SAMPLE_APPROVED", "NEGOTIATION", "NOTE"]
 
@@ -77,7 +85,14 @@ def _stage_rank(stage: str) -> int:
 
 
 def _deal_thread_key(deal: dict) -> tuple:
-    """同一客户 + 同一客户产品 + 开启/关闭桶 = 一个可执行 Deal Thread。"""
+    """同一客户 + 同一 Deal 产品 + 开启/关闭桶 = 一个可执行 Deal Thread。
+
+    ROUND 6.9 §4：直接复用 queue_ui.deal_identity_of —— 商机页与
+    侧栏/首页/Deal Detail 必须用同一把 Deal 身份键，不再各自定义口径。
+    """
+    key = q_ui.deal_identity_of(deal)
+    if key:
+        return key
     details = deal.get("details") or {}
     customer = deal.get("customer_id") or _norm_text("|".join([
         str(deal.get("company") or ""), str(deal.get("contact") or ""), str(deal.get("email") or "")]))
@@ -96,13 +111,53 @@ def _parse_dt(value):
         return dt.datetime.min
 
 
+# ROUND 7.0 §3 · Pipeline 与 Sidebar / 销售工作队列共用同一「代表 Deal 选择」口径
+#   排序键：OPEN 跟进任务优先 > 阶段推进最靠前 > 最近更新 > 新 ID（与
+#   queue_ui.representative_opp 同口径：见 ROUND 6.9 §4-5 / R23 §3）。
+#   这保证三处点击同一个 Deal 卡时打开的是同一个 lead_id —— Deal 身份
+#   唯一权威 = 商机层（deal_identity_of），代表 inquiry_id = 商机主关联
+#   inquiry_id；Sidebar / 销售队列另外用 representative_opp 做相同事。
+_DEAL_REP_TASKS_KEY = "_pipeline_rep_tasks"
+
+
 def _representative_deal(items: list[dict]) -> dict:
-    """选择线程里当前最能代表执行状态的一条 opportunity。"""
+    """选择线程里当前最能代表执行状态的一条 opportunity。
+
+    ROUND 7.0 §3：排序键与 queue_ui.representative_opp 对齐：
+      1. 有 OPEN 跟进任务者优先（任何 deal 挂的最近一条任务未完成即可）
+      2. 阶段推进最靠前（避开终态惩罚）
+      3. 最近更新
+      4. 新 ID（断平）
+    与 Sidebar / 销售工作队列返回同一 lead inquiry —— 三处点击 Deal 卡
+    一定打开同一个 Deal Detail。
+    """
+    # 汇总线程内全部机会的跟进任务作为排序信号；同一进程内复用一份缓存
+    # 避免每次 stage_rank / datetime.strptime 重复 IO（机会列表上限百级）。
+    cached = st.session_state.get(_DEAL_REP_TASKS_KEY)
+    if cached is None:
+        tasks_by_opp = {}
+        for x in items or []:
+            try:
+                tasks_by_opp[x["id"]] = db.list_followup_tasks(opportunity_id=x["id"]) or []
+            except Exception:
+                tasks_by_opp[x["id"]] = []
+        cached = tasks_by_opp
+        st.session_state[_DEAL_REP_TASKS_KEY] = tasks_by_opp
+
+    def _has_open_task(x):
+        for t in cached.get(x.get("id"), []) or []:
+            if str(t.get("status") or "").upper() == "OPEN":
+                return True
+        return False
+
     def sort_key(x):
         terminal_penalty = -100 if x.get("stage") in crm.TERMINAL else 0
-        return (terminal_penalty + _stage_rank(x.get("stage")),
-                _parse_dt(x.get("updated_at") or x.get("created_at")),
-                int(x.get("id") or 0))
+        return (
+            1 if _has_open_task(x) else 0,
+            terminal_penalty + _stage_rank(x.get("stage")),
+            _parse_dt(x.get("updated_at") or x.get("created_at")),
+            int(x.get("id") or 0),
+        )
     return max(items, key=sort_key)
 
 
@@ -130,6 +185,15 @@ def _decorate_deal_thread(rep: dict, items: list[dict]) -> dict:
     if all_quotes:
         latest_quote = sorted(all_quotes, key=lambda q: (int(q[1] or 0), str(q[6] or "")), reverse=True)[0]
     latest_task = _latest_followup(all_tasks)
+    # ROUND 7.1 §2：Pipeline **不**自算进度 —— 一律读 domain 层 progression。
+    #   同一 Deal 在 Pipeline / Deal Detail / AI 助手 / Sidebar 看到完全一致的
+    #   health / primary_reason / next_activity / recommended_transition。
+    try:
+        progression = prog.resolve_progression(
+            deal, tasks=all_tasks, quotes=all_quotes, activities=all_activities,
+            history=db.list_stage_history(rep.get("id")) or [], now=None)
+    except Exception:
+        progression = {}
     # Pipeline 金额按线程只计算一次，优先采用代表记录；代表记录无金额时取线程内最新非零金额。
     if not deal.get("amount"):
         nonzero = [x for x in items if x.get("amount")]
@@ -151,32 +215,116 @@ def _decorate_deal_thread(rep: dict, items: list[dict]) -> dict:
         "thread_health": health,
         "thread_risks": risks,
         "thread_data_quality": dq,
+        "progression": progression,
+        # 便捷字段（卡片/排序直接读，避免组件再推导）
+        "prog_health": (progression or {}).get("health") or "",
+        "prog_health_cn": (progression or {}).get("health_cn") or "",
+        "prog_health_icon": (progression or {}).get("health_icon") or "",
+        "prog_reason": (progression or {}).get("primary_reason") or "",
+        "prog_next": (progression or {}).get("card_next") or "",
+        "prog_na_status": (progression or {}).get("next_activity_status") or "",
+        "prog_stage_age": (progression or {}).get("stage_age_text") or "",
+        "prog_transition": (progression or {}).get("recommended_transition") or "",
+        "prog_transition_reason": (progression or {}).get("transition_reason") or "",
+        "prog_needs_action": bool((progression or {}).get("needs_action")),
+        "prog_exec_key": prog.exec_priority(progression or {}),
     })
     return deal
 
 
 def resolve_pipeline_deal_threads(raw_deals: list[dict]) -> list[dict]:
-    """Pipeline 页面唯一入口：把原始机会聚合为业务员可执行的 Deal Thread。"""
+    """Pipeline 页面唯一入口：把原始机会聚合为业务员可执行的 Deal Thread。
+
+    ROUND 7.1 §13：默认排序 = 执行优先级（OVERDUE > DUE TODAY > AT_RISK >
+    MISSING NEXT ACTIVITY > ATTENTION > WAITING CUSTOMER > SCHEDULED >
+    NO ACTION），**不再**只用 updated_at。同一档内用 updated_at / id 断平。
+    """
     buckets: dict[tuple, list[dict]] = {}
     for deal in raw_deals or []:
         buckets.setdefault(_deal_thread_key(deal), []).append(deal)
-    threads = [_decorate_deal_thread(_representative_deal(items), items) for items in buckets.values()]
-    return sorted(threads, key=lambda x: (_parse_dt(x.get("updated_at") or x.get("created_at")), int(x.get("id") or 0)), reverse=True)
+    threads = [_decorate_deal_thread(_representative_deal(items), items)
+               for items in buckets.values()]
+
+    def _sort_key(x):
+        exec_key = x.get("prog_exec_key") or (7, 0, 0, 0)
+        return (exec_key[0],
+                -_parse_dt(x.get("updated_at") or x.get("created_at")).toordinal(),
+                -int(x.get("id") or 0))
+    return sorted(threads, key=_sort_key, reverse=False)
+
+# ==========================================================================
+# ROUND 6.9 §1 · Pipeline 默认视图极简化
+#   默认只回答一个问题：现在有哪些 Deal、各在什么阶段。
+#     阶段列 + Deal 卡 + 搜索 + 快捷视图 + 新建商机
+#   AI Score / 国家 / 来源 / 负责人 / 健康度 / 阶段 等进阶筛选
+#     全部收进折叠「筛选」，默认不占版面。
+#   5 张金额 KPI 卡 → 压成 1 行说明（金额仍可查，只是不再抢占首屏）。
+#   点击 Deal 卡 → 共享 Deal Detail（与其它工作区同一个详情）。
+#
+# ROUND 7.1 §12 · 快捷视图加入「需处理」
+#   不重做筛选系统，只把最常用的执行视图提到默认位：
+#     全部 / 需处理 / 已逾期 / 高价值
+#   「需处理」= ATTENTION / AT_RISK / MISSING next / DUE TODAY / OVERDUE /
+#               内部动作待办（由 progression.needs_action 统一判定）。
+#   高价值**不删除**（其它地方仍可能依赖）—— 保留在快捷视图里，
+#   但不再作为默认推荐位的第一选择；金额不可靠时不会显示误导性加权值。
+# ==========================================================================
+PIPE_QUICK_VIEWS = ["全部", "需处理", "已逾期", "高价值"]
+
+
+def _summary(deals):
+    """1 行替代 5 张 KPI 卡：进行中 Deal 数 + 加权金额 + 逾期数 + 需处理数。
+
+    ROUND 7.1 §12：金额不可靠（无任何商机填过 amount）时**不显示**加权值，
+    避免把"客户目标价 / 估算值"当成本方报价误导销售。改用「N 个需处理」。
+    """
+    metrics = crm.pipeline_metrics(deals)
+    primary = "USD" if "USD" in metrics["by_currency"] else next(iter(metrics["by_currency"]), "USD")
+    weighted = (metrics["by_currency"].get(primary) or {}).get("weighted") or 0
+    has_amount = any(float(x.get("amount") or 0) > 0
+                     for x in deals if x.get("stage") not in crm.TERMINAL)
+    overdue = sum((x.get("prog_na_status") or "") == prog.NA_OVERDUE
+                  for x in deals if x.get("stage") not in crm.TERMINAL)
+    needs = sum(1 for x in deals
+                if x.get("prog_needs_action") and x.get("stage") not in crm.TERMINAL)
+    parts = [f"{metrics['active_count']} 个进行中 Deal"]
+    if has_amount:
+        parts.append(f"加权 {primary} {weighted:,.0f}")
+    parts.append(f"{needs} 个需处理")
+    parts.append(f"逾期跟进 {overdue}")
+    st.caption("　·　".join(parts))
+
+
+def _advanced_filters(deals):
+    """进阶筛选：默认折叠，需要时才展开。"""
+    with st.expander("筛选", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        stages = c1.multiselect("阶段", crm.STAGES, format_func=lambda x: crm.STAGE_CN[x],
+                                key="pipe_stages")
+        owners = c2.multiselect("负责人", sorted({x.get("owner") or "未分配" for x in deals}),
+                                key="pipe_owners")
+        healths = c3.multiselect("健康度", list(HEALTH_CN), format_func=lambda x: HEALTH_CN[x],
+                                 key="pipe_health")
+        c4, c5, c6 = st.columns(3)
+        countries = c4.multiselect("国家", sorted({x.get("country") for x in deals if x.get("country")}),
+                                   key="pipe_country")
+        sources = c5.multiselect("来源", sorted({x.get("source") or "未知" for x in deals}),
+                                 key="pipe_source")
+        min_score = c6.slider("最低 AI Score", 0, 100, 0, key="pipe_score")
+    return stages, owners, healths, countries, sources, min_score
+
 
 def _filtered(deals):
-    a, b, c, d = st.columns([2.2, 1.1, 1.1, 1.1])
-    query = a.text_input("搜索", placeholder="客户、产品、联系人", key="pipe_search")
-    stages = b.multiselect("阶段", crm.STAGES, format_func=lambda x: crm.STAGE_CN[x], key="pipe_stages")
-    owners = c.multiselect("负责人", sorted({x.get("owner") or "未分配" for x in deals}), key="pipe_owners")
-    healths = d.multiselect("健康度", ["healthy", "attention", "at_risk", "overdue"],
-                            format_func=lambda x: {"healthy":"健康","attention":"需关注","at_risk":"有风险","overdue":"已逾期"}[x], key="pipe_health")
-    e, f, g, h = st.columns(4)
-    countries = e.multiselect("国家", sorted({x.get("country") for x in deals if x.get("country")}), key="pipe_country")
-    sources = f.multiselect("来源", sorted({x.get("source") or "未知" for x in deals}), key="pipe_source")
-    min_score = g.slider("最低 AI Score", 0, 100, 0, key="pipe_score")
-    quick = h.selectbox("快速筛选", ["全部", "我的商机", "本月预计成交", "已逾期", "高价值"], key="pipe_quick")
+    """默认版面：搜索 + 快捷视图；其余筛选折叠在「筛选」里。"""
+    c1, c2 = st.columns([2.1, 2.4])
+    with c1:
+        query = st.text_input("搜索", placeholder="🔍 客户 / 产品 / 联系人",
+                              key="pipe_search", label_visibility="collapsed")
+    with c2:
+        quick = st.segmented_control("快捷视图", PIPE_QUICK_VIEWS, default="全部",
+                                     key="pipe_quick", label_visibility="collapsed") or "全部"
+    stages, owners, healths, countries, sources, min_score = _advanced_filters(deals)
     result = []
-    month = dt.datetime.now().strftime("%Y-%m")
     for deal in deals:
         health = crm.health_of(deal)
         haystack = " ".join(str(deal.get(k) or "") for k in ("company", "contact", "product", "title")).lower()
@@ -187,28 +335,12 @@ def _filtered(deals):
         if countries and deal.get("country") not in countries: continue
         if sources and (deal.get("source") or "未知") not in sources: continue
         if float(deal.get("ai_score") or 0) < min_score: continue
-        if quick == "我的商机" and (deal.get("owner") or "销售") != "销售": continue
-        if quick == "本月预计成交" and not str(deal.get("expected_close") or "").startswith(month): continue
-        if quick == "已逾期" and health["status"] != "overdue": continue
+        # ROUND 7.1 §12：快捷视图统一读 progression（不在 UI 里重算）
+        if quick == "需处理" and not deal.get("prog_needs_action"): continue
+        if quick == "已逾期" and (deal.get("prog_na_status") or "") != prog.NA_OVERDUE: continue
         if quick == "高价值" and float(deal.get("amount") or 0) < 10000: continue
         result.append(deal)
     return result
-
-
-def _kpis(deals):
-    metrics = crm.pipeline_metrics(deals)
-    primary_currency = "USD" if "USD" in metrics["by_currency"] else next(iter(metrics["by_currency"]), "USD")
-    bucket = metrics["by_currency"].get(primary_currency, {})
-    overdue = sum(crm.health_of(x)["status"] == "overdue" for x in deals if x.get("stage") not in crm.TERMINAL)
-    cols = st.columns(5)
-    cols[0].metric("Pipeline 总金额", _money(bucket.get("pipeline"), primary_currency))
-    cols[1].metric("加权 Pipeline", _money(bucket.get("weighted"), primary_currency))
-    cols[2].metric("进行中商机", metrics["active_count"])
-    cols[3].metric("本月预计成交", _money(bucket.get("closing_month"), primary_currency))
-    cols[4].metric("逾期跟进", overdue)
-    if len(metrics["by_currency"]) > 1:
-        st.caption("金额 KPI 默认显示 USD；其他币种分别统计：" + " · ".join(
-            f"{cur} {v['pipeline']:,.0f}" for cur, v in metrics["by_currency"].items() if cur != primary_currency))
 
 
 def _new_deal():
@@ -246,42 +378,75 @@ def _card_label(deal):
             f"Next: {next_text}")
 
 
-def _board(deals):
+def _pcard_html(deal, health):
+    """Pipeline Deal 卡（只读概览）。
+
+    ROUND 7.1 §11 最大层级（不新增模块、不加分数/图表/进度条）：
+        客户
+        产品 · 数量
+        Health + Primary Reason（一句业务原因）
+        下一步 · 到期
+    健康/原因/下一步全部来自 progression —— 组件不自己推导。
+    """
+    import html as _h
+    p = deal.get("progression") or {}
+    hl = p.get("health") or ""
+    icon = PROG_ICON.get(hl, "") or HEALTH_ICON.get((health or {}).get("status"), "")
+    hl_cn = p.get("health_cn") or (health or {}).get("label") or ""
+    reason = p.get("primary_reason") or ""
+    na = p.get("next_activity") or ""
+    na_status = p.get("next_activity_status") or ""
+    next_txt = p.get("card_next") or "未安排下一步"
+    qty = str(p.get("resolved_state", {}).get("resolvedRequirement", {}).get("quantity")
+              or deal.get("quantity") or "").strip()
+    company = _h.escape(str(deal.get("company") or deal.get("title") or ""))
+    product = _h.escape(str(deal.get("product") or "产品待补充"))
+    # 阶段停留（§5.2：只给紧凑文本，详细说明进 Deal Detail）
+    age = p.get("stage_age_text") or ""
+    age_txt = f" · {_h.escape(age)}" if age and age != "今天" else ""
+    # 推荐阶段迁移（§9：只提示，不自动执行）
+    tr = p.get("recommended_transition_cn") or ""
+    tr_html = (f"<div class='nx tr'>建议推进至 {_h.escape(tr)}</div>"
+               if tr else "")
+    na_cls = " nx" + (" od" if na_status == prog.NA_OVERDUE
+                      else (" miss" if na_status == prog.NA_MISSING else ""))
+    # 鼠标悬停显示完整挂牌信息（与 _card_label 同一口径，供快速核对）
+    tip = (_h.escape(_card_label(deal)).replace("\n", " · ")
+           .replace("'", "&#39;").replace('"', "&quot;"))
+    return (f"<div class='pcard clickable {hl.lower() or (health or {}).get('status','')}' title='{tip}'>"
+            f"<div class='co'>{company}</div>"
+            f"<div class='pd'>{product}{(' · ' + _h.escape(qty)) if qty else ''}</div>"
+            f"<div class='amt'>{_money(deal.get('amount'), deal.get('currency'))}</div>"
+            f"<div class='meta'>{icon} {_h.escape(str(hl_cn))}{age_txt}</div>"
+            f"<div class='rsn'>{_h.escape(reason)}</div>"
+            f"<div class='nx{na_cls[3:]}'>下一步：{_h.escape(next_txt)}</div>"
+            + tr_html +
+            "</div>")
+
+
+def _board(deals, open_deal):
+    """阶段看板：左→右 = 推进顺序；点卡片进 Deal Detail。
+
+    ROUND 6.9 §1：卡片可点击（复用全局 .clickable 覆盖层），保留
+    拖拽排序会让卡片无法点击，因此拖动改阶段的能力移除 ——
+    阶段推进统一在 Deal Detail / 「商机管理」折叠区完成。
+    """
     active_stages = [s for s in crm.STAGES if s not in crm.TERMINAL]
-    containers = [{"header": f"{crm.STAGE_CN[s]} · {sum(x.get('stage') == s for x in deals)}",
-                   "items": [_card_label(x) for x in deals if x.get("stage") == s]} for s in active_stages]
-    original = {x["id"]: x["stage"] for x in deals}
-    sorted_containers = sort_items(containers, multi_containers=True, direction="horizontal",
-        custom_style=""".sortable-component{background:#f3f5f8;border-radius:10px;padding:8px;min-width:245px}
-        .sortable-container-header{font-weight:700;color:#26344d;padding:6px}
-        .sortable-item{white-space:pre-line;background:white;color:#172033;border:1px solid #e7eaf0;border-radius:9px;
-        box-shadow:0 1px 3px rgba(20,32,60,.08);padding:10px;margin:7px 0;font-size:12px;line-height:1.55;min-height:96px}""")
-    for index, container in enumerate(sorted_containers):
-        target = active_stages[index]
-        for label in container.get("items", []):
-            match = re.match(r"#(\d+)", label)
-            if match and original.get(int(match.group(1))) != target:
-                st.session_state.pipeline_pending = {"id": int(match.group(1)), "target": target}
-                st.rerun()
-
-
-def _list_view(deals):
-    rows = []
-    for x in deals:
-        health = x.get("thread_health") or crm.health_of(x)
-        dq = x.get("thread_data_quality") or {"score": "—"}
-        qsum = x.get("quote_summary") or crm.quote_lifecycle_summary(db.list_quotes(x["id"]))
-        latest_task = x.get("latest_followup") or {}
-        rows.append({"客户": x.get("company") or x["title"], "产品": x.get("product"),
-            "阶段": crm.STAGE_CN.get(x.get("stage"), x.get("stage")),
-            "金额": _money(x.get("amount"), x.get("currency")),
-            "报价": (f"{qsum.get('label')} V{qsum.get('latest_version')}" if qsum.get("latest_version") else qsum.get("label")),
-            "往来": x.get("raw_count", 1), "负责人": x.get("owner"),
-            "健康": health["label"], "数据质量": dq.get("score"),
-            "风险": len(x.get("thread_risks") or []),
-            "下次跟进": latest_task.get("due_at") or x.get("next_action_at") or "—",
-            "Next Action": x.get("next_action") or "—"})
-    st.dataframe(rows, use_container_width=True, hide_index=True)
+    cols = st.columns(len(active_stages), gap="small")
+    for col, stage in zip(cols, active_stages):
+        rows = [x for x in deals if x.get("stage") == stage]
+        col.markdown(f"<div class='phead'>{crm.STAGE_CN[stage]}"
+                     f"<span>{len(rows)}</span></div>", unsafe_allow_html=True)
+        if not rows:
+            col.caption("—")
+        for deal in rows[:6]:
+            health = deal.get("thread_health") or crm.health_of(deal)
+            col.markdown(_pcard_html(deal, health), unsafe_allow_html=True)
+            col.button("", key=f"pipe_open_{deal['id']}", use_container_width=True,
+                       on_click=open_deal, args=(deal.get("inquiry_id"),),
+                       help=f"打开 #{deal['id']} · {deal.get('company') or deal['title']} 的 Deal Detail")
+        if len(rows) > 6:
+            col.caption(f"…另有 {len(rows) - 6} 个")
 
 
 def _transition_dialog(deals):
@@ -410,27 +575,38 @@ def _detail(deal):
         c2.button("发送邮件", disabled=True, help="当前项目尚未接入邮箱发送 API")
 
 
-def render_pipeline_page():
+def render_pipeline_page(open_deal=None):
+    """Pipeline 页（ROUND 6.9 §1：默认视图 = Deal，不是筛选器）。
+
+    首屏 = 阶段列 + Deal 卡 + 搜索 + 快捷视图 + 新建商机；
+    进阶筛选折叠；报价版本 / 阶段推进折叠在「商机管理」里。
+    """
     st.markdown("## Deal Pipeline")
     st.caption("外贸销售机会 · 从询盘验证、需求确认、报价与样品，到谈判、PO 和成交")
     raw_deals = db.list_opportunities()
     deals = resolve_pipeline_deal_threads(raw_deals)
-    _kpis(deals); _new_deal()
-    raw_total = len(raw_deals)
-    if raw_total > len(deals):
-        st.caption(f"Pipeline 已按商机聚合：{len(deals)} 个可执行商机 · {raw_total} 条历史记录。")
+    _summary(deals)
+    _new_deal()
+    if len(raw_deals) > len(deals):
+        st.caption(f"已按 Deal 聚合：{len(deals)} 个可执行商机 · {len(raw_deals)} 条历史记录。")
     shown = _filtered(deals)
+    if not shown:
+        st.info("当前条件下暂无商机。")
+    else:
+        _board(shown, open_deal or _default_open)
+        st.caption("点卡片打开 Deal Detail（与其它工作区同一个详情）。")
     _transition_dialog(deals)
-    view = st.segmented_control("视图", ["看板", "列表"], default="看板", key="pipeline_view")
-    main, side = st.columns([3.25, 1.15], gap="large")
-    with main:
-        if not shown: st.info("当前筛选条件下暂无商机。")
-        elif view == "看板": _board(shown)
-        else: _list_view(shown)
-        st.caption("拖动卡片后需确认阶段条件；Won / Lost 始终要求人工确认。")
-    with side:
+    with st.expander("🛠 商机管理（报价版本 · 阶段推进）", expanded=False):
         if shown:
-            labels = {f"#{x['id']} · {x.get('company') or x['title']} · {x.get('raw_count', 1)}条记录": x for x in shown}
+            labels = {f"#{x['id']} · {x.get('company') or x['title']} · {x.get('raw_count', 1)}条记录": x
+                      for x in shown}
             selected_label = st.selectbox("打开商机", labels, key="pipeline_deal_picker")
             _detail(labels[selected_label])
-        else: st.caption("选择或新建商机后查看详情。")
+        else:
+            st.caption("选择或新建商机后查看详情。")
+
+
+def _default_open(inquiry_id):
+    """未注入跳转回调时的兜底：至少把该询盘选中，供其它区域读取。"""
+    if inquiry_id:
+        st.session_state.selected_id = inquiry_id

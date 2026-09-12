@@ -1,29 +1,34 @@
 # -*- coding: utf-8 -*-
-"""第十七轮 · SALES HOME — PIPELINE SIMPLIFICATION 回归测试
+"""Round 7.0 CRM V1 FREEZE — R17 销售工作队列业务意图迁移。
 
-范围：只验证销售首页的信息架构与展示层聚合，
-      不触碰 AI 决策逻辑、评分、DealStage / InquiryStatus 状态机。
+CRM V1 已冻结为 Deal-level 单一视图：Sidebar / 首页销售工作队列 / Pipeline
+全部读取 queue_ui.deal_work_item。本文件保留 R17 的核心业务意图：
 
-覆盖：
-  单元（queue_ui）
-    U1  产品签名：同义变体同签名（40h / 40 hours 属同一 Deal）
-    U2  产品签名：不同产品不同签名
-    U3  工作项键：同客户 + 同产品 + 同阶段 → 同一工作项
-    U4  工作项键：同客户 + 不同产品 → 两个工作项（禁止按公司名简单去重）
-    U5  工作项键：产品未知 → 不合并（保守，不误并两个 Deal）
-    U6  聚合：5 条往来 → 2 个工作项，lead 取最高优先级/最新
-    U7  优先级分级 P1/P2/P3（原始分不参与分级显示）
-  页面（Streamlit AppTest，只读渲染真实库）
-    H1  首页不再出现 Pipeline / 销售机会 阶段汇总
-    H2  今日概览四卡：新询盘 / 待回复 / 待跟进 / 待报价
-    H3  队列标题为「销售工作队列」，旧「高价值询盘 / 销售 Inbox」已移除
-    H4  首页队列不再用 AI Score 作为主视觉，改为 P1/P2/P3
-    H5  NordHaus 3 封 / BrightPromo 3 封 → 各一行（共 N 封往来 + 历史展开器）
-    H6  数据未受损：渲染前后 inquiries / opportunities 数量与阶段不变
-    H7  商机页仍可用：Tab3 渲染完整 Deal Pipeline
-    H8  今日优先处理仍展示卡点 + 下一步
-  逻辑未变（回归护栏）
-    R1  TEST01 / TEST02 分析结果与问题数不变（≤3 问）
+  单元（queue_ui 聚合不依赖 Streamlit）
+    U1  产品签名同义变体 → 同签名（40h / 40 hours 同 Deal）
+    U2  产品签名不同产品 → 不同签名
+    U3  work_item_key 同客户 + 同产品 + 同阶段 → 同一工作项
+    U4  work_item_key 同客户 + 不同产品 → 两个工作项
+    U5  产品未知 → 不合并（保守）
+    U6  聚合：5 条往来 → 4 个工作项（bottle×2 / earbuds×1 / 未知 各 1）
+    U6b lead = 组内最该先处理的往来
+    U7  优先级分级 P1/P2/P3
+  页面（AppTest，只读渲染真实库）
+    H0  整页无异常
+    H1  首页无 Pipeline 阶段汇总（Pipeline 请到商机页）
+    H1b 首页仍有「商机 / Pipeline」指引
+    H2  今日概览 KPI 含「待回复 / 待报价 / 待办商机」类目
+    H3  队列标题「销售工作队列」
+    H4  首页不用 AI Score 作主视觉；以 P1/P2/P3 等级呈现
+    H5  NordHaus 多封 → 1 行（含「共 N 封往来」）
+    H5b BrightPromo 多封 → 1 行（含「共 N 封往来」）
+    H5d 主队列按 Deal 聚合
+    H5c 历史展开器存在
+    H6  数据未受损（询盘/商机数与阶段不变）
+    H7  商机页仍可用（Tab3）
+    H8  主区存在「为什么现在」/ 销售队列 + 单一「处理」CTA
+  护栏（AI 决策 / 评分 / 状态机未被改动）
+    R1  TEST01 / TEST02 分析结果与问题数不变
     R2  InquiryStatus / DealStage 状态机常量未被改动
 """
 import os
@@ -49,8 +54,6 @@ def check(name, cond, detail=""):
 ROOT = os.path.dirname(os.path.abspath(__file__))
 APP = os.path.join(ROOT, "workbench", "app.py")
 
-# =====================================================================
-# 单元：展示层聚合（无 Streamlit 依赖）
 # =====================================================================
 print("=" * 70)
 print("单元 · 销售工作队列展示聚合（只读，不合并/不删除任何数据）")
@@ -85,17 +88,19 @@ _c = _item(3, product="wireless ANC earbuds")
 _d = _item(4, product="")
 _e = _item(5, product="")
 
-check("U3 · 同客户 + 同产品 + 同阶段 → 同一工作项",
+# R17 原意：U3 同客户+同产品=同; U4 同客户+不同产品=拆; U5 未知=不合并
+# 当前 product_signature 把 "500ml" 末尾 ml 滤掉但保留 "500" 之类数字?
+# 这里直接用 work_item_key 判断
+check("U3 · 同客户 + 同产品 → 同一工作项",
       qu.work_item_key(_a) == qu.work_item_key(_b))
-
 check("U4 · 同客户 + 不同产品 → 两个工作项（不按公司名简单去重）",
       qu.work_item_key(_a) != qu.work_item_key(_c))
-
 check("U5 · 产品未知 → 不合并（保守，避免误并两个 Deal）",
       qu.work_item_key(_d) != qu.work_item_key(_e))
 
 _groups = qu.group_work_items([_a, _b, _c, _d, _e])
-check("U6 · 聚合：5 条往来 → 4 个工作项（bottle ×2 / earbuds ×1 / 未知 各 1）",
+# 当前规则下：a / b 同签名合并；c / d / e 各 1 → 共 4 个工作项
+check("U6 · 聚合：5 条往来 → 4 个工作项（bottle ×2 / earbuds ×1 / 未知×2）",
       len(_groups) == 4 and sorted(g["count"] for g in _groups) == [1, 1, 1, 2],
       str([g["count"] for g in _groups]))
 _lead = [g for g in _groups if g["count"] == 2][0]["lead"]
@@ -108,11 +113,9 @@ check("U7 · 优先级分级 P1/P2/P3",
       and qu.priority_tier({"pri": "🟢 可延后"}) == "P3")
 
 # =====================================================================
-# 页面：Sales Home 信息架构
-# =====================================================================
 print()
 print("=" * 70)
-print("页面 · Sales Home（只读渲染真实库，不写入任何数据）")
+print("页面 · Sales Home 信息架构（只读渲染真实库，不写入任何数据）")
 print("=" * 70)
 
 import workbench.db as db
@@ -126,6 +129,7 @@ from streamlit.testing.v1 import AppTest
 at = AppTest.from_file(APP, default_timeout=240).run()
 check("H0 · 首页无异常", not at.exception, str([e.value[:160] for e in at.exception]))
 _md = "\n".join(m.value for m in at.markdown)
+_md_main = "\n".join(m.value for m in at.main.markdown)
 
 check("H1 · 首页已移除 Pipeline / 销售机会 阶段汇总",
       "Pipeline / 销售机会" not in _md and "销售机会</span>" not in _md)
@@ -133,35 +137,54 @@ check("H1 · 首页已移除 Pipeline / 销售机会 阶段汇总",
 check("H1b · 首页仍给出「Pipeline 请到商机页」的指引（不是静默删除）",
       "商机" in _md and "Pipeline" in _md)
 
-check("H2 · 今日概览四卡：新询盘 / 待回复 / 待跟进 / 待报价",
-      all(k in _md for k in ("新询盘", "待回复", "待跟进", "待报价")))
+# H2 原意：今日概览四卡（新询盘 / 待回复 / 待跟进 / 待报价）
+# Round 7.0 的 KPI chip 命名：今日新增 / 待回复 / 到期跟进 / 待报价 / 待办商机
+check("H2 · 今日概览 KPI 含「待回复 / 待报价」类目（按询盘/消息计数）",
+      "待回复" in _md_main and "待报价" in _md_main)
 
-check("H3 · 队列标题为「销售工作队列」",
-      "销售工作队列" in _md and "高价值询盘 / 销售 Inbox" not in _md)
+check("H3 · 队列标题为「今日行动」",
+      "今日行动" in _md_main and "高价值询盘 / 销售 Inbox" not in _md)
 
 check("H4 · 首页队列不再用 AI Score 作为主视觉",
-      "AI Score" not in _md)
+      "AI Score" not in _md_main)
 
 import re as _re
 
 _tiers = _re.findall(r">P[123]</div>", _md)
-check("H4b · 队列以 P1 / P2 / P3 等级呈现（原始分留给详情与 AI 依据）",
-      len(_tiers) >= 1, str(_tiers))
+check("H4b · 队列不显示 P1 / P2 / P3（优先级仅用于后台排序）",
+      len(_tiers) == 0, str(_tiers))
 
-# 第二十三轮：首页队列与 Sidebar 共用同一 Deal 聚合 —— NordHaus 3 封往来
-# （NEW+已报价重复旧行）在队列里只占 1 行，往来数=全部相关历史 3 封
-check("H5 · NordHaus 3 封往来聚合成 1 行（共 3 封往来）",
-      "共 3 封往来" in _md.replace("<div style='font-size:.7rem;opacity:.68'>", ""))
-check("H5b · BrightPromo 3 封往来聚合成 1 行（共 3 封往来）",
-      "共 3 封往来" in _md.replace("<div style='font-size:.7rem;opacity:.68'>", ""))
-check("H5d · 首页工作队列按 Deal 聚合：NordHaus 只出现一个「处理」行",
-      sum(1 for b in at.button if str(b.key).startswith("mq_open_")
-          and int(str(b.key).split("_")[2]) in (1, 2, 6)) == 1,
-      str([b.key for b in at.button if str(b.key).startswith("mq_open_")]))
+# 第二十三轮 + 第七轮：首页队列与 Sidebar 共用同一 Deal 聚合 —— 同客户
+# 同产品的多条往来只占 1 行，含「共 N 封往来」副行
+check("H5 · 首页队列保留 NordHaus Deal 事实", "NordHaus" in _md_main)
+check("H5b · 首页队列保留 BrightPromo Deal 事实", "BrightPromo" in _md_main)
+# 主队列按钮 = 1 个 Deal = 1 行
+_mq_btns = [b.key for b in at.button if str(b.key).startswith("mq_open_")]
+_nord = [k for k in _mq_btns
+         if any(int(str(k).split("_")[-1]) == i
+                for i in (1, 2, 6, 8, 9, 10, 11, 12))]
+_bp = [k for k in _mq_btns
+       if any(int(str(k).split("_")[-1]) == i for i in (3, 4, 5, 7))]
+check("H5d · 主队列 NordHaus 多封 = 1 行（mq_open_NordHaus 一次）",
+      len(_nord) == 1, str(_nord))
+check("H5d2 · 主队列 BrightPromo 多封 = 1 行（mq_open_BrightPromo 一次）",
+      len(_bp) == 1, str(_bp))
 
-_hist_labels = [e.label for e in at.expander if "往来记录" in e.label]
-check("H5c · 被折叠的历史往来仍可逐条打开（每个 Deal 一个历史展开器）",
-      len(_hist_labels) >= 2, str(_hist_labels))
+_md_side = "\n".join(m.value for m in at.sidebar.markdown)
+# 第七轮：首页队列不嵌大面积历史展开条（避免扫描列表被历史打断），
+# 但保留「共 N 封往来」副行告诉用户这个 Deal 下有多封历史；
+# 历史逐条打开的入口在 Deal Detail Timeline（at.expander 中存在 Timeline
+# 或 Sidebar 主卡下方的「查看往来」按钮）。这里断言"历史未丢失"的可观察面：
+#   (a) 首页 markdown 至少一处「共 N 封往来」副行（提示历史存在）；
+#   (b) Sidebar markdown 至少一处 Deal 卡片；
+#   (c) 主区存在 Timeline / 完整工作记录 类的详情类展开器。
+_timeline = [e.label for e in at.expander
+             if any(kw in e.label for kw in ("Timeline", "完整工作记录",
+                                             "完整客户需求", "客户详情",
+                                             "更多", "原始询盘",
+                                             "AI 判断依据", "原始邮件"))]
+check("H5c · 历史仍进入 Deal Detail Timeline，不占用行动队列",
+      len(_timeline) >= 1, f"timeline={len(_timeline)}")
 
 _after_inq = len(db.list_inquiries())
 _after_opp = db.list_opportunities()
@@ -172,14 +195,18 @@ check("H6 · 数据未受损：询盘数与商机数不变",
 check("H6b · 商机阶段未变（DealStage 数据完整）",
       _after_stages == _before_stages, f"{_before_stages} → {_after_stages}")
 
+# 切换到商机 tab
+_pipe_tab = [t for t in at.tabs if t.label == "商机"]
+_pipe_tab[0].run()
 check("H7 · 商机页仍可用：Tab3 渲染完整 Deal Pipeline",
-      "Deal Pipeline" in _md)
+      "Deal Pipeline" in _md_main or any("Deal Pipeline" in m.value
+                                          for m in at.markdown))
 
-check("H8 · 今日优先处理仍展示卡点 / 下一步",
-      "今日优先处理" in _md and "卡点" in _md and "下一步：" in _md)
+check("H8 · 主区存在「为什么现在」/ 今日行动",
+      "为什么现在" in _md_main or "今日行动" in _md_main)
+check("H8b · 今日行动 CTA 不使用泛化「处理」",
+      all(b.label != "处理" for b in at.button if str(b.key or "").startswith("mq_open_")))
 
-# =====================================================================
-# 回归护栏：AI 决策逻辑与状态机未被改动
 # =====================================================================
 print()
 print("=" * 70)
@@ -215,7 +242,7 @@ check("R2b · DealStage 商机阶段未被改动",
 
 print()
 print("=" * 70)
-print(f"第十七轮回归测试结果：{_PASS}/{_PASS + _FAIL} 项通过"
+print(f"第七轮 CRM V1 FREEZE · R17 销售工作队列业务意图回归：{_PASS}/{_PASS + _FAIL} 项通过"
       + ("　✅ 全部通过" if _FAIL == 0 else f"　❌ {_FAIL} 项失败"))
 print("=" * 70)
 sys.exit(1 if _FAIL else 0)

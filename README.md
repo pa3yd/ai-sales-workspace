@@ -65,8 +65,7 @@ config.json 模板（**注意：该文件已被 .gitignore 排除，不会上传
 4. 启动工作台（首次运行自动创建空数据库）：
 
 ```bash
-cd workbench
-streamlit run app.py
+.venv\\Scripts\\python.exe -m streamlit run workbench\\app.py --server.address 127.0.0.1 --server.port 8501
 ```
 
 浏览器打开 http://localhost:8501 即进入工作台。

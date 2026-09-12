@@ -6,6 +6,7 @@
 运行：python test_workflow_r7.py
 """
 import os
+import re
 import sys
 import json
 import shutil
@@ -257,9 +258,9 @@ _B = _seed(_rep(product_known=False, qty=1000, draft="Could you share the model?
 at = AppTest.from_file(os.path.join(_BASE, "workbench", "app.py"),
                        default_timeout=90)
 at.run()
-# 打开 B（后插入的询盘，默认排序在前）
-_btns = [b for b in at.sidebar.button if str(b.key).startswith("open_")]
-_btn_map = {int(str(b.key).split("_")[1]): b for b in _btns}
+# 从当前实际渲染的首页行动入口打开 B；Sidebar Recent Access 不能作为首次入口。
+_btn_map = {int(str(b.key).split("_")[-1]): b for b in at.button
+            if re.fullmatch(r"mq_open_\d+", str(b.key or ""))}
 if _B in _btn_map:
     _btn_map[_B].click().run()
     check("打开 B 无异常", len(at.exception) == 0,
@@ -282,7 +283,7 @@ if _B in _btn_map:
           all(str(k).endswith(str(_B)) or str(k).endswith(str(_A))
               for k in _akeys), str(_akeys))
 else:
-    check("Test 10 打开询盘 B", False, "no open buttons")
+    check("Test 10 打开询盘 B", False, "no rendered homepage action")
 
 # ================= UI 闭环：标记已发送按钮 + 跟进区 =================
 print("== UI：标记已发送 → REPLIED → 跟进区出现 ==")
@@ -291,8 +292,8 @@ _id_ui = _seed(_rep(product_known=True, qty=500, draft="Hello, thanks for your i
 at2 = AppTest.from_file(os.path.join(_BASE, "workbench", "app.py"),
                         default_timeout=90)
 at2.run()
-_btns2 = {int(str(b.key).split("_")[1]): b for b in at2.sidebar.button
-          if str(b.key).startswith("open_")}
+_btns2 = {int(str(b.key).split("_")[-1]): b for b in at2.button
+           if re.fullmatch(r"mq_open_\d+", str(b.key or ""))}
 if _id_ui in _btns2:
     _btns2[_id_ui].click().run()
     # 结单入口：待回复（READY_TO_REPLY）阶段状态机禁止直接跳 WON → 不显示
@@ -314,7 +315,7 @@ if _id_ui in _btns2:
         check("已回复阶段显示结单入口（人工确认制）",
               any("deal_won_" in str(b.key) for b in at2.main.button))
 else:
-    check("UI 闭环打开询盘", False, "no open buttons")
+    check("UI 闭环打开询盘", False, "no rendered homepage action")
 
 print()
 print(f"结果：{_PASS} 通过 / {_FAIL} 失败")

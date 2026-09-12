@@ -218,3 +218,75 @@ def recommended_action(deal: dict, health: dict | None = None) -> dict:
                "PO_PENDING": "确认 PO 与付款条款", "WON": "安排订单交付", "LOST": "记录复盘结论"}
     action = "立即完成逾期跟进" if health["status"] == "overdue" else actions.get(deal.get("stage"), "安排下一活动")
     return {"action": action, "reason": health["reason"], "follow_up": "今天" if health["status"] in {"overdue", "at_risk"} else "按计划"}
+
+
+# ==========================================================================
+# ROUND 6.9 §3 · 客户档案行（CRM record）
+#   客户档案页的默认结构不再是 A/B/C/D 等级分组，而是一行一个客户记录：
+#       公司 / 主要联系人 / 活跃商机 / 最近联系 / 下一次活动
+#   等级降为次要属性（一个 chip），只用于参考，不再决定页面怎么分组。
+# ==========================================================================
+def customer_record(customer, opportunities=None, followups=None) -> dict:
+    """把 list_customers() 一行 + 该客户商机/跟进任务，解析成一条 CRM 记录视图。
+
+    纯函数：不查库、不写库、不改状态。客户身份仍然是唯一主语，
+    商机与跟进只是挂在客户下面的活动事实。
+    """
+    import json as _json
+    if isinstance(customer, dict):
+        cid = customer.get("id")
+        company = customer.get("company")
+        country = customer.get("country")
+        email = customer.get("email")
+        contact = customer.get("contact")
+        inquiry_count = customer.get("inquiry_count") or 0
+        last_grade = customer.get("last_grade")
+        grade = customer.get("grade") or last_grade
+        last_contact = customer.get("last_contact") or customer.get("last_seen")
+        contacts_json = customer.get("contacts_json") or "[]"
+    else:
+        row = list(customer or []) + [None] * 12
+        (cid, company, country, email, contact, inquiry_count) = row[:6]
+        last_grade = row[6]
+        last_contact = row[8]
+        grade = row[9] or last_grade
+        contacts_json = row[11] or "[]"
+    try:
+        contacts = _json.loads(contacts_json)
+        if not isinstance(contacts, list):
+            contacts = []
+    except Exception:
+        contacts = []
+    names = [str(c.get("name") or "").strip() for c in contacts
+             if isinstance(c, dict) and str(c.get("name") or "").strip()]
+    primary_contact = names[0] if names else (contact or email or "—")
+
+    opps = list(opportunities or [])
+    active = [o for o in opps if o.get("stage") not in TERMINAL]
+
+    open_tasks = [t for t in (followups or [])
+                  if str(t.get("status") or "OPEN").upper() == "OPEN"]
+    next_activity = None
+    if open_tasks:
+        task = sorted(open_tasks,
+                      key=lambda t: (str(t.get("due_at") or "9999-12-31"),
+                                     int(t.get("id") or 0)))[0]
+        next_activity = {"due_at": task.get("due_at") or "",
+                         "action": (task.get("next_action") or task.get("title")
+                                    or "跟进客户")}
+    return {
+        "id": cid,
+        "company": company or email or "（未署名）",
+        "country": country or "",
+        "email": email or "",
+        "contact": primary_contact,
+        "contact_count": len(names) or (1 if contact else 0),
+        "inquiry_count": inquiry_count or 0,
+        "active_deals": len(active),
+        "deal_count": len(opps),
+        "last_contact": last_contact,
+        "next_activity": next_activity,
+        "grade": grade or "未定",
+        "grades": {"manual": row[9] if not isinstance(customer, dict) else customer.get("grade"),
+                   "lead": last_grade},
+    }

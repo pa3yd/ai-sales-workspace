@@ -209,9 +209,9 @@ at = AppTest.from_file(_APP, default_timeout=120)
 at.run()
 check("A-1 页面无异常", not at.exception)
 main_md = "\n".join(str(x.value) for x in at.main.markdown)
-check("A-2 今日销售任务仍在", "今日销售任务" in main_md)
+check("A-2 今日行动队列仍在", "今日行动" in main_md)
 check("A-3 KPI 真实业务指标仍在",
-      all(k in main_md for k in ("今日新增", "待回复", "待跟进", "待报价")))
+      all(k in main_md for k in ("今日新增", "待回复", "到期跟进", "待报价")))
 
 print("=" * 52)
 print(f"第十轮验收场景：通过 {_PASS} · 失败 {_FAIL}")

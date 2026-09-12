@@ -1,11 +1,9 @@
 # -*- coding: utf-8 -*-
-"""ROUND 5.3 · Sidebar Deal Thread Cleanup.
+"""CRM Sidebar Deal Integrity & Density regression.
 
-Checks that the sidebar shows one current Deal card per active deal, while
-historical messages are compressed into lightweight timeline rows and no longer
-repeat current Next Action copy.
+Sidebar is navigation + recent Deal access. It should not behave as a second
+full sales queue with separate open/history controls.
 """
-
 import os
 import sys
 import shutil
@@ -21,10 +19,10 @@ sys.path.insert(0, str(ROOT / "workbench"))
 import db  # noqa: E402
 
 
-def _report(product, qty):
+def _report(product, qty, company="NordHaus Electronics GmbH"):
     return {
         "extracted": {
-            "company": "NordHaus Electronics GmbH",
+            "company": company,
             "country": "Germany",
             "contact_name": "Michael Weber",
             "quantity": qty,
@@ -40,68 +38,90 @@ def _report(product, qty):
     }
 
 
-def test_sidebar_deal_history_is_compact_and_non_actionable():
+def test_sidebar_is_navigation_and_quick_access_only():
     old_db = db.DB_PATH
     tmp = tempfile.mkdtemp()
     db.DB_PATH = os.path.join(tmp, "workbench.db")
     try:
         db.init_db()
-        ids = [
-            db.save_inquiry(
-                "Previous quote request for 5,000 pcs Wireless ANC Earbuds.",
-                _report("Wireless ANC Earbuds", 5000),
-            ),
-            db.save_inquiry(
-                "Updated quote request for 3,000 pcs Wireless ANC Earbuds.",
-                _report("Wireless ANC Earbuds", 3000),
-            ),
-            db.save_inquiry(
-                "Follow-up for 3,000 pcs Wireless ANC Earbuds.",
-                _report("Wireless ANC Earbuds", 3000),
-            ),
-        ]
-        db.save_inquiry(
-            "New request for Wireless ANC Headphones, 1,000 pcs.",
-            _report("Wireless ANC Headphones", 1000),
-        )
+        for text, product, qty in [
+            ("Previous quote request for 5,000 pcs Wireless ANC Earbuds.", "Wireless ANC Earbuds", 5000),
+            ("Updated quote request for 3,000 pcs Wireless ANC Earbuds.", "Wireless ANC Earbuds", 3000),
+            ("Follow-up for 3,000 pcs Wireless ANC Earbuds.", "Wireless ANC Earbuds", 3000),
+            ("New request for Wireless ANC Headphones, 1,000 pcs.", "Wireless ANC Headphones", 1000),
+        ]:
+            db.save_inquiry(text, _report(product, qty))
 
-        at = AppTest.from_file(str(ROOT / "workbench" / "app.py"),
-                               default_timeout=90).run()
+        at = AppTest.from_file(str(ROOT / "workbench" / "app.py"), default_timeout=90).run()
         assert not at.exception, [getattr(e, "value", str(e)) for e in at.exception]
 
         buttons = [(str(b.key), str(b.label)) for b in at.sidebar.button]
-        open_deal = [x for x in buttons if x[0].startswith("open_deal_")]
-        history_toggles = [x for x in buttons if x[0].startswith("sd_open_")]
-        assert len(open_deal) == 2, buttons
-        assert len(history_toggles) == 1, buttons
-
+        labels = "\n".join(label for _, label in buttons)
+        keys = [key for key, _ in buttons]
         md = "\n".join(str(x.value) for x in at.sidebar.markdown)
-        assert "3 条往来" in md
-        assert "Wireless ANC Earbuds" in md
-        assert "Wireless ANC Headphones" in md
 
-        # Open the history for the earbuds deal.
-        toggle = next(b for b in at.sidebar.button
-                      if str(b.key).startswith("sd_open_"))
-        toggle.click().run()
+        assert "exec_start_side" not in keys, buttons
+        assert "开始处理" not in labels
+        assert not any(k.startswith("sd_open_") or k.startswith("sd_close_") for k in keys), buttons
+        assert not any(k.startswith("open_hist_") for k in keys), buttons
+        assert "打开商机" not in labels and "历史" not in labels, labels
+
+        for name in ("优先处理", "待回复", "待报价", "今日跟进", "已逾期", "新询盘", "全部商机"):
+            assert f"sv_{name}" in keys, buttons
+        assert any(str(e.label) == "筛选与视图" for e in at.sidebar.expander), [str(e.label) for e in at.sidebar.expander]
+        assert "最近访问" in md
+        assert "打开商机后会显示在这里" in md
+        # Sidebar 默认不是第二个 Deal 队列；从首页行动打开后才出现最近访问。
+        action_key = next(str(b.key) for b in at.button if str(b.key).startswith("mq_open_"))
+        at.button(key=action_key).click().run()
+        recent = [str(b.key) for b in at.sidebar.button if str(b.key).startswith("open_recent_")]
+        assert len(recent) == 1, recent
+        at.sidebar.button(key=recent[0]).click().run()
+        repeat = [str(b.key) for b in at.sidebar.button if str(b.key).startswith("open_recent_")]
+        assert repeat == recent, repeat
+        quick_md = "\n".join(str(x.value) for x in at.sidebar.markdown).split("最近访问", 1)[-1]
+        assert "#" not in quick_md and "P1" not in quick_md and "分" not in quick_md, quick_md
+
+        # 待报价是低频入口，仍可访问但零数量不显示成显眼徽标。
+        quote_labels = [label for key, label in buttons if key == "sv_待报价"]
+        assert quote_labels == ["💰 待报价"], quote_labels
+        assert "sidebar_all_deals" not in keys, keys
+    finally:
+        db.DB_PATH = old_db
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_quick_access_is_limited_to_five_deals():
+    """Quick Access 只用于快速进入重点 Deal，不能随队列长度无限增长。"""
+    old_db = db.DB_PATH
+    tmp = tempfile.mkdtemp()
+    db.DB_PATH = os.path.join(tmp, "workbench.db")
+    try:
+        db.init_db()
+        for index in range(7):
+            product = f"Product Variant {index + 1}"
+            db.save_inquiry(
+                f"Request for {product}, {index + 1}000 pcs.",
+                _report(product, (index + 1) * 1000, company=f"Buyer {index + 1} GmbH"),
+            )
+
+        at = AppTest.from_file(str(ROOT / "workbench" / "app.py"), default_timeout=90).run()
         assert not at.exception, [getattr(e, "value", str(e)) for e in at.exception]
-
-        md2 = "\n".join(str(x.value) for x in at.sidebar.markdown)
-        buttons2 = [(str(b.key), str(b.label)) for b in at.sidebar.button]
-        hist_buttons = [x for x in buttons2 if x[0].startswith("open_hist_")]
-
-        assert hist_buttons, buttons2
-        assert all(label == "查看" for _, label in hist_buttons), hist_buttons
-        assert "打开这条历史" not in "\n".join(label for _, label in buttons2)
-        assert "下一步：查看并发送回复" not in md2
-        assert "历史往来 · 当前动作以主卡为准" in md2 or "历史数量：" in md2
-        # Same product + same quantity historical rows are visually compressed.
-        assert len(hist_buttons) < len(ids), hist_buttons
+        assert not [str(button.key) for button in at.sidebar.button
+                    if str(button.key).startswith("open_recent_")]
+        # Recent Access 的上限是 3，且只能由实际访问产生。
+        action_keys = [str(button.key) for button in at.button if str(button.key).startswith("mq_open_")]
+        for key in action_keys[:4]:
+            at.button(key=key).click().run()
+        recent = [str(button.key) for button in at.sidebar.button
+                  if str(button.key).startswith("open_recent_")]
+        assert 1 <= len(recent) <= 3, recent
     finally:
         db.DB_PATH = old_db
         shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
-    test_sidebar_deal_history_is_compact_and_non_actionable()
-    print("sidebar round 5.3 cleanup tests passed")
+    test_sidebar_is_navigation_and_quick_access_only()
+    test_quick_access_is_limited_to_five_deals()
+    print("sidebar round 6.8 simplification tests passed")

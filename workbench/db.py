@@ -366,7 +366,8 @@ def save_inquiry(source_text: str, report: dict) -> int:
     record_activity(new_id, "ANALYZED", "AI 完成询盘分析", actor="AI")
     if (report.get("draft") or "").strip():
         record_activity(new_id, "REPLY_GENERATED", "生成客户回复草稿", actor="AI")
-    # 每条新询盘创建独立商机；后续可在客户层面并行管理不同产品/项目。
+    # 新消息先按既有 Deal identity 归属：同一商业机会追加往来和事实；
+    # 只有确实没有既有 Deal 时才初始化一个 NEW 商机。
     create_opportunity_from_inquiry(cust_id, new_id, report)
     return new_id
 
@@ -785,7 +786,7 @@ def _merge_opportunity_details(existing: dict, inquiry_id, report: dict,
 
 
 def create_opportunity_from_inquiry(customer_id, inquiry_id, report: dict) -> int:
-    """从一条新询盘创建独立商机；只在该询盘尚未建档时写入。
+    """将一条询盘归属到既有 Deal，或创建一个新的 Deal。
 
     TEST03：客户产品短语（product_query）在库内无匹配时仍是"客户要的产品"——
     商机 product 列与标题回退到客户原话，保证「同一客户 + 新产品 = 新 Deal」；
@@ -844,6 +845,8 @@ def create_opportunity_from_inquiry(customer_id, inquiry_id, report: dict) -> in
     if existing:
         merged = _merge_opportunity_details(existing, inquiry_id, report,
                                             product, details)
+        # DealStage 是已持久化的销售流程状态。新的询盘、客户回复或需求修订
+        # 只会更新消息关联和当前事实，绝不能把既有 Deal 重置为 NEW。
         c.execute("""UPDATE opportunities
                      SET details_json=?, product=COALESCE(NULLIF(product,''), ?),
                          title=COALESCE(NULLIF(title,''), ?),
@@ -873,14 +876,44 @@ def create_opportunity_from_inquiry(customer_id, inquiry_id, report: dict) -> in
 
 
 def backfill_opportunities() -> int:
-    """为旧版已有询盘一次性补建独立商机，已关联的询盘不会重复创建。"""
+    """为旧版已有询盘一次性补建独立商机，已关联的询盘不会重复创建。
+
+    ROUND 7.2 修复（性能 + 正确性）：
+      「已关联」不能只看 `opportunities.inquiry_id`。一个 Deal 会吸收同一客户
+      的多次往来，主询盘只写 `inquiry_id`，其余往来记在
+      `details_json.related_inquiry_ids` / `current_inquiry_id` 里。
+      旧查询只 JOIN 主键列，导致这 10 条询盘被永远判为「未关联」，
+      每次 rerun 都重跑一遍 → 侧栏切换卡顿，且反复重写 details_json/updated_at。
+
+      现在改为：先排除主键列已关联的，再排除 related_inquiry_ids 里的，
+      真正需要补建的才处理。全部已关联时查询结果为空，零成本返回。
+    """
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""SELECT i.id, i.customer_id, i.report_json FROM inquiries i
                  LEFT JOIN opportunities o ON o.inquiry_id=i.id
                  WHERE o.id IS NULL""")
-    rows = c.fetchall()
+    candidates = c.fetchall()
+    if not candidates:
+        conn.close()
+        return 0
+    # 收集已被任何 Deal 通过 related_inquiry_ids / current_inquiry_id 关联的询盘 id
+    c.execute("SELECT inquiry_id, details_json FROM opportunities")
+    linked = set()
+    for main_iid, raw in c.fetchall():
+        if main_iid:
+            linked.add(main_iid)
+        try:
+            details = json.loads(raw or "{}")
+        except Exception:
+            details = {}
+        for iid in (details.get("related_inquiry_ids") or []):
+            if iid:
+                linked.add(iid)
+        if details.get("current_inquiry_id"):
+            linked.add(details["current_inquiry_id"])
     conn.close()
+    rows = [r for r in candidates if r[0] not in linked]
     created = 0
     for inquiry_id, customer_id, raw in rows:
         try:
@@ -890,7 +923,6 @@ def backfill_opportunities() -> int:
         create_opportunity_from_inquiry(customer_id, inquiry_id, report)
         created += 1
     return created
-
 
 
 def reconcile_duplicate_opportunities() -> int:
@@ -928,10 +960,18 @@ def reconcile_duplicate_opportunities() -> int:
     for _, members in groups.items():
         if len(members) < 2:
             continue
-        # newest id/update is the current business state; older rows become history
+        # 最新记录提供当前事实（例如最近修订后的数量），但阶段是持久化的
+        # 流程状态。历史库中的重复行可能带着一个较新的 NEW，不能因此把
+        # 已报价/样品/谈判中的 Deal 回退到 NEW。
         members_sorted = sorted(members, key=lambda x: (str(x[0]["updated_at"] or ""), int(x[0]["id"])))
         keeper, keeper_details = members_sorted[-1]
         keeper_id = keeper["id"]
+        from sales_crm import STAGES, PROBABILITY
+        stage_rank = {stage: index for index, stage in enumerate(STAGES)}
+        preserved_stage = max(
+            (str(row["stage"] or "NEW") for row, _ in members_sorted),
+            key=lambda stage: stage_rank.get(stage, -1),
+        )
         merged_details = dict(keeper_details or {})
         related = list(merged_details.get("related_inquiry_ids") or [])
         qty_history = list(merged_details.get("quantity_history") or [])
@@ -973,10 +1013,11 @@ def reconcile_duplicate_opportunities() -> int:
         _co_name = (_co_row[0] if _co_row else "") or ""
         _clean_title = " · ".join(x for x in (_co_name, clean_product) if x) or keeper["title"]
         c.execute("""UPDATE opportunities
-                     SET details_json=?, product=?, title=?, updated_at=?, last_activity_at=?
+                     SET details_json=?, product=?, title=?, stage=?, probability=?, updated_at=?, last_activity_at=?
                      WHERE id=?""",
-                  (json.dumps(merged_details, ensure_ascii=False), clean_product or keeper["product"],
-                   _clean_title, now, now, keeper_id))
+                   (json.dumps(merged_details, ensure_ascii=False), clean_product or keeper["product"],
+                    _clean_title, preserved_stage, PROBABILITY.get(preserved_stage, keeper["probability"]),
+                    now, now, keeper_id))
     # Also clean legacy product/title fields for already-merged single Deals.
     c.execute("""SELECT o.*, c.company AS customer_company
                  FROM opportunities o

@@ -121,9 +121,12 @@ def test_round61_full_inquiry_pressure_consistency():
             threads = pipeline_ui.resolve_pipeline_deal_threads(opps)
             assert len(threads) == 3
             nord = next(t for t in threads if t.get("company") == "NordHaus Electronics GmbH" and t.get("product") == "Wireless ANC Earbuds")
-            assert nord["raw_count"] == 2
-            assert nord["message_count"] == 2
-            assert "2条记录" in pipeline_ui._card_label(nord)
+            # ROUND 6.9 §4：5,000 → 3,000 是同一次商业机会的数量修订，
+            # 由 Deal 创建/解析源逻辑直接收敛成一条记录（不是前端去重），
+            # 所以 Pipeline 线程内只有 1 条商机记录，而不是 2 条并列记录。
+            assert nord["raw_count"] == 1
+            assert nord["message_count"] == 1
+            assert "2条记录" not in pipeline_ui._card_label(nord)
             assert "Wireless ANC Earbuds" in pipeline_ui._card_label(nord)
 
             groups = ui.group_deal_threads(_queue_rows(), {o["inquiry_id"]: o["stage"] for o in opps})

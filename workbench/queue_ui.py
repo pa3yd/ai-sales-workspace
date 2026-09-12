@@ -460,10 +460,39 @@ _CLOSED_STAGE = {"WON", "LOST", "NURTURE", "ON_HOLD"}
 _CLOSED_BIZ = {"WON", "LOST", "ON_HOLD"}
 
 
-def deal_thread_key(item: dict, stage_of: dict = None) -> tuple:
+def deal_identity_of(opp: dict) -> tuple | None:
+    """商机记录 → Deal 权威身份键（只读）。
+
+    ROUND 6.9 §4：Deal 身份的唯一来源是商机层。客户把同一个产品写成不同
+    短语时（"Wireless ANC Earbuds" / "Wireless ANC Earbuds with Bluetooth
+    5.4, ANC, 40h…"），商机层已经把它们收敛成一条记录 —— 展示层必须沿用
+    这一个身份，而不是按每封询盘的原始产品文本各自分组（那是前端去重，
+    会让同一个 Deal 在侧栏/首页裂成两行）。
+
+    产品签名取「商机产品」（Deal 主语），不取单封询盘的原话。
+    """
+    if not opp:
+        return None
+    cust = deal_customer_key(opp.get("customer_id"), opp.get("company"),
+                             opp.get("contact"), opp.get("id"))
+    details = opp.get("details") or {}
+    sig = product_signature(opp.get("product") or details.get("product_query")
+                            or details.get("customerProductRequirement")
+                            or opp.get("title") or "")
+    if not sig:
+        return ("dealopp", cust, opp.get("id"))
+    closed = str(opp.get("stage") or "").upper() in _CLOSED_STAGE
+    return ("deal", cust, sig, "closed" if closed else "open")
+
+
+def deal_thread_key(item: dict, stage_of: dict = None,
+                    deal_of: dict = None) -> tuple:
     """Deal / Conversation Thread 展示身份键（只读，不写任何数据）。
 
     组合信号（缺任一信号自动降级，绝不只靠公司名或产品名合并）：
+      0) **Deal 权威身份**：该询盘已归档到某个商机时，直接用商机身份
+         （deal_of: inquiry_id → deal_identity_of(opp)）—— 与商机页 /
+         Deal Detail 同一把键，杜绝同一 Deal 在不同工作区裂成多行；
       1) Deal 客户身份：规范化公司名 > customer_id > 联系人
       2) 产品签名：product_signature —— 同一产品项目的多封往来同一把键
       3) 活跃/已闭环桶：商机终态（WON/LOST/NURTURE/ON_HOLD，来自
@@ -472,6 +501,9 @@ def deal_thread_key(item: dict, stage_of: dict = None) -> tuple:
     产品短语缺失 → 退回按单条询盘隔离（宁可不合并，不误并两个 Deal）。
     """
     it = item or {}
+    known = (deal_of or {}).get(it.get("id"))
+    if known:
+        return known
     cust = deal_customer_key(it.get("cust_id"), it.get("company"),
                              it.get("contact"), it.get("id"))
     need = it.get("need") or {}
@@ -487,7 +519,8 @@ def deal_thread_key(item: dict, stage_of: dict = None) -> tuple:
     return ("deal", cust, sig, "closed" if closed else "open")
 
 
-def group_deal_threads(items: list, stage_of: dict = None) -> list:
+def group_deal_threads(items: list, stage_of: dict = None,
+                       deal_of: dict = None) -> list:
     """把队列条目按「Deal / Conversation Thread」聚合（只读，保序）。
 
     输入 items 已按队列排序（Queue Score 等）。同一个 Deal 只出现一次：
@@ -495,11 +528,13 @@ def group_deal_threads(items: list, stage_of: dict = None) -> list:
               优先级 / Next Best Action 一律取自 lead（最新可执行口径），
               绝不用历史某条旧 Inquiry 的状态冒充当前状态；
       items = 该 Deal 全部往来（历史完整保留，UI 展开后逐条可见）。
+    deal_of: inquiry_id → deal_identity_of(opp)，有商机时以商机身份为准
+             （ROUND 6.9 §4：Deal 身份由源逻辑决定，展示层不做二次去重）。
     返回 [{"key", "items", "lead", "count"}]。
     """
     ordered = {}
     for it in items or []:
-        k = deal_thread_key(it, stage_of)
+        k = deal_thread_key(it, stage_of, deal_of)
         ordered.setdefault(k, []).append(it)
     groups = []
     for k, bucket in ordered.items():

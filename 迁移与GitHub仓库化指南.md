@@ -64,8 +64,7 @@
    ```
 7. 启动：
    ```bash
-   cd workbench
-   streamlit run app.py
+   .venv\\Scripts\\python.exe -m streamlit run workbench\\app.py --server.address 127.0.0.1 --server.port 8501
    ```
    浏览器打开 http://localhost:8501。
 
@@ -168,8 +167,7 @@ cd ai-sales-workspace
 
 ```bash
 set DEEPSEEK_API_KEY=sk-你的key
-cd workbench
-streamlit run app.py
+.venv\\Scripts\\python.exe -m streamlit run workbench\\app.py --server.address 127.0.0.1 --server.port 8501
 ```
 
 浏览器打开 http://localhost:8501 即完成。以后代码有更新：
@@ -201,7 +199,7 @@ git push
 ## 5. 常见问题
 
 - **Q：启动报 API 错误 / Key 无效？** A：确认环境变量或 config.json 里 key 是 `sk-` 开头完整串；环境变量优先级更高，若设过错的先删掉。
-- **Q：端口被占用？** A：`streamlit run app.py --server.port 8502` 换端口。
+- **Q：端口被占用？** A：`.venv\\Scripts\\python.exe -m streamlit run workbench\\app.py --server.address 127.0.0.1 --server.port 8502` 换端口。
 - **Q：数据库在哪个目录？** A：代码锚定 `workbench/workbench.db`，无论从哪启动都读写这个文件，不会漂移。
 - **Q：忘了 key 在哪台电脑配过？** A：config.json 只在本地、已被 git 排除，不会随仓库传播——每台电脑都要单独配。
 - **Q：桌面 `Desktop/AI询盘agent` 是旧的？** A：对。最新代码在工作区 `WorkBuddy\...\qa_acceptance\AI询盘agent`。若坚持用桌面版，请先把工作区新版覆盖过去再打包。

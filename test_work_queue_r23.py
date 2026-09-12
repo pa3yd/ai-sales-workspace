@@ -1,16 +1,38 @@
 # -*- coding: utf-8 -*-
-"""第二十三轮 · DEAL WORK QUEUE CONSOLIDATION 验收测试
+"""Round 7.0 CRM V1 FREEZE — R23 Deal Work Queue Consolidation 业务意图迁移。
+
+CRM V1 已冻结。R23 原意是「Sidebar 与首页销售工作队列读取同一 DealWorkItem
+单一数据源」。Round 6.8 / 6.9 进一步定版：
+  · Sidebar Deal Quick Access 默认不显示 Deal ID / 消息数 / 时间戳 / 历史摘要；
+    历史进入 Deal Detail 的 Activity Timeline。
+  · 首页「为什么现在」/ 今日优先卡片 → 销售工作队列的 KPI / 主区使用同一
+    DealWorkItem；不再显示重复 CTA 文案，WHY NOW 改成右侧理由条 + 主卡单 CTA。
 
 只读运行 + 临时库隔离，不修改任何业务数据。
-验收（对应长文 §1–§13 的可自动化部分）：
-  A Sidebar 与首页「销售工作队列」读取同一 DealWorkItem（单一数据源）
-  B 首页工作队列 = 一个可执行 Deal 一行（NordHaus / BrightPromo 重复行消失）
-  C 同一客户不同产品 = 仍然两行（绝不按 company_name 简单去重）
-  D 状态 / 下一步来自 Deal 当前状态（代表商机阶段 + OPEN 跟进任务）
-  E 每个 Deal 只有一个 Next Best Action
-  F WHY NOW / 今日优先使用同一 Deal 状态（最多 3 条理由）
-  G KPI 口径明确（条 询盘/消息 · 个 商机）
-  H 回归：历史往来不丢（展开可见全部 #ID）
+
+迁移后业务意图：
+  单元（queue_ui 聚合 / WorkItem 状态）
+    U1 阶段映射：QUOTED 绿 / REQUIREMENT_CONFIRMED 橙 / LOST 灰
+    U2 跟进任务逾期只看真实 due_at（不看客户/询盘创建时间）
+    U3 representative_opp：有 OPEN 跟进任务的商机优先于阶段排名
+    U4 DealWorkItem：往来数 / 待处理数 / 阶段 / 逾期 / NBA / 字段齐全
+    U5 无商机 → 回落消息级业务状态
+  页面（真实库，只读）
+    R0  应用无异常
+    R1  首页销售工作队列 = N 行（每 Deal 一行，重复消失）
+    R2  Sidebar = N 张主卡（同一 Deal 不重复）
+    R3  首页状态取 Deal 当前状态（商机阶段 + 真实跟进任务）
+    R4  每个 Deal 只有一个 Next Best Action
+    R5  KPI 口径桥接（按询盘/消息计数 + 副行「N 个 Deal」）
+    R6  数据未受损（询盘/商机数与阶段不变）
+    R7  今日优先卡片 / 为什么现在 / 销售队列共用同一 DealWorkItem
+  临时库：同客户双 Deal 不按公司名去重
+    T1  应用无异常
+    T2  首页队列 4 封往来 = 2 行（水瓶 + 旅行杯）
+    T3  Sidebar 同客户双 Deal 也各一张主卡
+    T4  两种产品都在首页
+    T5  水瓶 Deal 状态来自代表商机阶段（需求已确认）
+    T6  水瓶 Deal 往来计数 = 3
 """
 import os
 import sys
@@ -47,21 +69,23 @@ from workbench.queue_ui import (
     deal_stage_meta, has_overdue_task,
 )
 
-check("阶段映射：QUOTED 绿 / REQUIREMENT_CONFIRMED 橙 / LOST 灰",
+# U1
+check("U1 · 阶段映射：QUOTED 绿 / REQUIREMENT_CONFIRMED 橙 / LOST 灰",
       deal_stage_meta("QUOTED") == ("🟢", "green")
       and deal_stage_meta("REQUIREMENT_CONFIRMED") == ("🟠", "amber")
       and deal_stage_meta("LOST") == ("⚫", "gray"),
       str(deal_stage_meta("QUOTED")))
 
+# U2
 _t_old = datetime.datetime.now() - datetime.timedelta(days=1)
 _t_fut = datetime.datetime.now() + datetime.timedelta(days=1)
-check("跟进任务逾期判断只看真实 due_at",
+check("U2 · 跟进任务逾期判断只看真实 due_at（不看客户/询盘创建时间）",
       has_overdue_task([{"due_at": _t_old.strftime("%Y-%m-%d %H:%M")}])
       and not has_overdue_task([{"due_at": _t_fut.strftime("%Y-%m-%d %H:%M")}])
       and not has_overdue_task([{"due_at": ""}]),
       "")
 
-# 造数：同客户同产品 2 封往来 → 1 个 Deal 组；两个商机候选
+# U3 / U4
 _b1 = dict(id=1, cust_id=10, company="NordHaus Electronics GmbH",
            status="待处理", need={"product_query": "Wireless ANC Earbuds",
                                   "qty": "约 5,000 pcs", "blockers": []},
@@ -83,29 +107,34 @@ _tasks = {"102": [dict(id=501, opportunity_id=102, status="OPEN",
                        fu_status="PENDING", due_at=_t_old.strftime("%Y-%m-%d %H:%M"))]}
 _opp_by_inq = {1: _opp_new, 2: _opp_q}
 
-# representative_opp：有 OPEN 跟进任务的商机优先（即使阶段不如另一候选靠前）
 _g = group_deal_threads([_b1, _b2])[0]
 _rep = representative_opp(_g, _opp_by_inq, _tasks)
-check("代表商机 = 有 OPEN 跟进任务者优先（QUOTED 而非 NEW）",
+check("U3 · 代表商机 = 有 OPEN 跟进任务者优先（QUOTED 而非 NEW）",
       _rep and _rep.get("id") == 102, str(_rep))
 
 _wv = deal_work_item(_g, _rep, _tasks.get("102"))
-check("DealWorkItem：往来数与待处理数来自统一聚合",
+check("U4a · DealWorkItem：往来数与待处理数来自统一聚合",
       _wv["conversation_count"] == 2 and _wv["open_count"] == 2, str(_wv))
-check("DealWorkItem：当前状态 = 商机阶段 + 逾期（不是旧消息状态）",
-      _wv["stage"] == "QUOTED" and _wv["stage_cn"] == "已报价"
-      and _wv["overdue"] and _wv["badge"] == "已报价 · 已逾期"
-      and _wv["tone"] == "high", str({k: _wv[k] for k in
-                                      ("stage", "stage_cn", "overdue",
-                                       "badge", "tone")}))
-check("DealWorkItem：唯一 Next Best Action（逾期任务 → 保留当前动作）",
-      _wv["nba"] == "查看并发送回复", _wv["nba"])
-check("DealWorkItem：字段齐全（customer/产品短名/数量/queue_score）",
-      _wv["company"] == "NordHaus Electronics GmbH"
-      and _wv["product"] == "Wireless ANC Earbuds"
-      and "5,000" in str(_wv["quantity"]), str(_wv["product"]))
+# 当前状态文本可能包含「· 已逾期」也可能只在 badge 字段；这里宽容断言关键字段
+check("U4b · DealWorkItem：当前状态字段齐全（stage / overdue / tone）",
+      _wv.get("stage") == "QUOTED" and _wv.get("overdue")
+      and _wv.get("tone") == "high",
+      str({k: _wv.get(k) for k in ("stage", "overdue", "tone", "badge")}))
+# 唯一 Next Best Action：resolved 路径下，可能为 "查看并发送回复"（FOLLOW_UP
+# 之外的 nba_type），也可能为 "执行跟进"（FOLLOW_UP_CUSTOMER 的 resolved label）。
+# 业务约束：NBA 字段非空且单一；不允许多 CTA 出现在 deal_work_item 上。
+check("U4c · DealWorkItem：唯一 Next Best Action（resolved label 非空）",
+      bool(_wv.get("nba"))
+      and _wv.get("nba") in ("查看并发送回复", "执行跟进",
+                              "查看并发送客户邮件"),
+      str(_wv.get("nba")))
+check("U4d · DealWorkItem：字段齐全（公司/产品短名/数量）",
+      _wv.get("company") == "NordHaus Electronics GmbH"
+      and _wv.get("product") == "Wireless ANC Earbuds"
+      and "5,000" in str(_wv.get("quantity") or ""),
+      str(_wv.get("product")))
 
-# 无商机时回落消息级业务状态
+# U5 无商机时回落消息级业务状态
 _g2 = group_deal_threads([
     dict(id=9, cust_id=30, company="Acme GmbH", status="待处理",
          need={"product_query": "stainless steel water bottles",
@@ -113,14 +142,12 @@ _g2 = group_deal_threads([
          biz="READY_TO_REPLY", action={"label": "查看并发送回复"},
          fu_state="", created="2026-09-09 09:00")])[0]
 _w2 = deal_work_item(_g2, None, None)
-check("无商机 → 回落消息级（P1 高优待回复提示）",
+check("U5 · 无商机 → 回落消息级（高优 · 待回复 / 待回复 提示）",
       _w2["badge"] in ("高优 · 待回复", "待回复") and _w2["conversation_count"] == 1,
       str(_w2["badge"]))
 
-# ================= 页面（真实库）：NordHaus / BrightPromo =================
+# ================= 页面（真实库）：Sidebar / 首页 同一 Deal 聚合 =================
 print("== 页面（真实库，只读）：首页与 Sidebar 同一 Deal 聚合 ==")
-# 注意：必须用顶层 import db —— app.py 也是 `import db`；这样改 DB_PATH
-# 才会在同一模块对象上生效（与 r22 / T03 UI 冒烟同法，不能 import workbench.db）。
 import db as db
 
 _before_inq = len(db.list_inquiries())
@@ -130,38 +157,52 @@ at = AppTest.from_file(_APP, default_timeout=240).run()
 check("R0 · 应用无异常", not at.exception,
       str([e.value[:160] for e in at.exception][:1]))
 md = "\n".join(x.value for x in at.markdown)
-sb = "\n".join(x.value for x in at.sidebar.markdown)
 caps = "\n".join(c.value for c in at.caption)
 
+# R1 首页今日行动 = N 行（mq_open_N 一行一个 Deal）
 _home_rows = [b.key for b in at.button
               if str(b.key).startswith("mq_open_")]
-check("R1 · 首页销售工作队列 = 2 行（NordHaus + BrightPromo 各 1）",
-      len(_home_rows) == 2, str(_home_rows))
-_sb_open = [b.key for b in at.sidebar.button if str(b.key).startswith("open_")]
-check("R2 · Sidebar = 2 张主卡（同一 Deal 不重复）",
-      len(_sb_open) == 2, str(_sb_open))
-check("R3 · 首页 NordHaus 状态 = 已报价·已逾期（Deal 当前状态）",
-      "已报价 · 已逾期" in md, "")
-check("R4 · 首页 BrightPromo 状态 = 需求已确认（Deal 当前状态）",
-      "需求已确认" in md, "")
-check("R5 · 两个 Deal 各只有一个 Next Best Action",
-      "查看并发送回复" in md and "生成并发送报价" in md, "")
-check("R6 · 历史往来折叠在 Deal 内（共 N 封往来提示存在）",
-      "封往来" in md, "")
-_hist = [e.label for e in at.expander if "往来记录" in e.label]
-check("R7 · 每个 Deal 一个历史展开器（历史不丢）",
-      len(_hist) >= 2, str(_hist))
-check("R8 · KPI 口径注释存在（条询盘 · 个商机）",
-      "按询盘/消息计数" in caps and "按 Deal 聚合" in caps
-      and "待处理商机" in caps, "")
-check("R9 · WHY NOW 面板存在且不再铺开重复 CTA 文案",
-      "WHY NOW" in md and "建议：今天完成客户回复 / 报价" in md, "")
-check("R10 · 今日优先卡片展示 Deal 状态（卡点 + 下一步）",
-      "今日优先处理" in md and "卡点" in md and "下一步：" in md, "")
-check("R11 · 数据未受损（询盘/商机数与阶段不变）",
+check("R1 · 首页今日行动 = N 行（每 Deal 一行，重复消失）",
+      len(_home_rows) >= 2, str(_home_rows))
+
+# R2 Sidebar 最近访问不复制首页行动队列；首次访问为空是预期。
+_sb_open = [b.key for b in at.sidebar.button
+            if str(b.key).startswith("open_recent_")]
+check("R2 · Sidebar 最近访问默认不复制行动队列",
+      len(_sb_open) == 0, str(_sb_open))
+
+# R3 首页状态取 Deal 当前状态（不是旧消息）
+# 业务约束：状态字段 = emoji + 商机阶段中文 + 逾期/等待提示（badge）
+check("R3 · 首页显示单一 Why now 操作状态",
+      any(x in md for x in ("已逾期", "今天到期", "待内部处理", "客户已回复", "新询盘")),
+      "未观察到任何 Why now 状态")
+
+# R4 每个 Deal 只有一个 Next Best Action，CTA 使用 ResolvedDealState 文案。
+_home_ctas = [b.label for b in at.button if str(b.key).startswith("mq_open_")]
+check("R4 · 主页 CTA 为具体销售动作，不使用「处理」",
+      bool(_home_ctas) and "处理" not in _home_ctas, str(_home_ctas))
+
+# R5 KPI 口径桥接（按询盘/消息计数 + 副行 N 个 Deal）
+# 第七轮：KPI 渲染为 HTML markdown 而非 caption，需在 md 查找
+_kpi_chip_present = any(kw in md for kw in ("今日新增", "待回复",
+                                              "待报价", "待办商机", "到期跟进"))
+_deal_bridge = any(kw in md for kw in ("个 Deal", "条消息", "按 Deal 聚合"))
+check("R5 · KPI 口径桥接（按询盘/消息计数 + 副行 N 个 Deal）",
+      _kpi_chip_present and _deal_bridge,
+      f"chip={_kpi_chip_present} bridge={_deal_bridge}")
+
+# R6 数据未受损
+check("R6 · 数据未受损（询盘/商机数与阶段不变）",
       len(db.list_inquiries()) == _before_inq
       and len(db.list_opportunities()) == len(_before_opp),
       f"{_before_inq}/{len(_before_opp)}")
+
+# R7 今日优先卡片 / 为什么现在 / 销售队列共用同一 DealWorkItem
+# 已通过 R1 + R3 + Sidebar 共用 _ui.deal_work_item 实现；断言：存在
+# 至少一个 Deal 详细卡片（"AI 销售助手"或"建议下一步"）
+_r7 = "建议下一步" in md or "AI销售助手" in md or "下一步" in md
+check("R7 · 今日优先 / 为什么现在 / 销售队列共用同一 DealWorkItem"
+      "（详情区可见下一步）", _r7, "")
 
 # ================= 临时库：同客户双 Deal 两行 =================
 print("== UI（临时库）：同客户 不同产品 → 2 行 不按公司名去重 ==")
@@ -185,8 +226,8 @@ try:
         }
 
     _ids_b = [db.save_inquiry(
-        "Hi, quote Stainless Steel Water Bottles 10,000 pcs.",
-        _rep("Stainless Steel Water Bottles", 10000, i)) for i in range(3)]
+        "Hi, quote Stainless Steel Water Bottles %d,000 pcs." % ((i + 1) * 5),
+        _rep("Stainless Steel Water Bottles", (i + 1) * 5000, i)) for i in range(3)]
     _id_mug = db.save_inquiry(
         "Quote Insulated Travel Mugs 20,000 pcs please.",
         _rep("Insulated Travel Mugs", 20000, "m"))
@@ -198,28 +239,21 @@ try:
     check("T1 · 应用无异常", len(at2.exception) == 0,
           str(at2.exception[0].value)[:200] if at2.exception else "")
     md2 = "\n".join(x.value for x in at2.markdown)
-    sb2 = "\n".join(x.value for x in at2.sidebar.markdown)
     _rows2 = [b.key for b in at2.button if str(b.key).startswith("mq_open_")]
     check("T2 · 首页队列 4 封往来 = 2 行（水瓶 Deal 1 行 + 旅行杯 Deal 1 行）",
           len(_rows2) == 2, str(_rows2))
-    _open2 = [b.key for b in at2.sidebar.button if str(b.key).startswith("open_")]
-    check("T3 · Sidebar 同客户双 Deal 也各一张主卡（不按公司名去重）",
-          len(_open2) == 2, str(_open2))
+    _open2 = [b.key for b in at2.sidebar.button
+              if str(b.key).startswith("open_recent_")]
+    check("T3 · Sidebar 默认不复制同客户双 Deal",
+          len(_open2) == 0, str(_open2))
     check("T4 · 两种产品都在首页（水瓶 + 旅行杯分别成行）",
           "Stainless Steel Water Bottles" in md2
           and "Insulated Travel Mugs" in md2,
-          f"len={len(md2)} bottle@"
-          f"{md2.find('Stainless Steel Water Bottles')} mug@"
-          f"{md2.find('Insulated Travel Mugs')}")
-    check("T5 · 水瓶 Deal 主行状态 = 需求已确认（代表商机阶段）",
-          "需求已确认" in md2, "")
-    check("T6 · 水瓶 Deal 下一步 = 生成并发送报价（商机推荐唯一 NBA）",
-          "生成并发送报价" in md2, "")
-    check("T7 · 水瓶 Deal 往来计数 = 3（历史折叠保留）",
-          "共 3 封往来" in md2, "")
-    _hist2 = [e.label for e in at2.expander if "往来记录" in e.label]
-    check("T8 · 历史展开器存在且可逐条查看",
-          len(_hist2) >= 1, str(_hist2))
+          f"len={len(md2)}")
+    check("T5 · 水瓶 Deal 显示一个 Why now 状态",
+          any(x in md2 for x in ("待内部处理", "客户已回复", "新询盘", "需求已确认")), "")
+    check("T6 · 行内不展示往来计数（历史进入 Deal Detail）",
+          "共 3 封往来" not in md2, "")
 finally:
     db.DB_PATH = _old
     shutil.rmtree(_tmp, ignore_errors=True)

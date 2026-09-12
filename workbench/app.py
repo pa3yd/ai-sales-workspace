@@ -101,6 +101,15 @@ if not (hasattr(_pipeline_ui, "render_pipeline_page")
     except Exception:
         pass
 
+# ROUND 7.1：Deal Progression Engine（领域层，无 Streamlit 依赖）
+import progression as _pg
+if not (hasattr(_pg, "resolve_progression") and hasattr(_pg, "progression_of")):
+    try:
+        import importlib as _il_pg
+        _pg = _il_pg.reload(_pg)
+    except Exception:
+        pass
+
 # Phase 2：Customer + Opportunity Workspace 纯逻辑层（无 Streamlit 依赖）
 import workspace as _wsx
 if not hasattr(_wsx, "build_timeline"):
@@ -187,8 +196,60 @@ def _row_has_draft(row) -> bool:
         return False
 
 
+# —— ROUND 7.2：load_queue 轮次级缓存 ——
+# app.py 顶层每次 rerun 重跑，同一轮里 load_queue(None) 会被多处重复调用。
+# 缓存键含「数据版本号」，任何写路径 bump 版本即失效，不会读到陈旧数据。
+_LOAD_QUEUE_CACHE: dict = {}
+_QUEUE_VERSION = {"v": 0}
+# ROUND 7.2：客户档案页的「客户 id → 跟进任务」映射（只依赖商机与任务，
+# 与搜索词无关）。同轮 rerun 内复用，写路径 bump 版本号即失效。
+_FU_OF_CUST_CACHE: dict = {}
+# ROUND 7.2：活动流缓存（Inquiry / Deal 两种键），返回**副本**，
+# 避免调用方就地修改污染缓存（调用方会做 acts += [...]）。
+_ACTIVITY_CACHE: dict = {}
+
+
+def _cached_activity(dbmod, kind, obj_id):
+    """按 (kind, obj_id, 数据版本) 复用活动流查询；未命中则查询并缓存副本。"""
+    if obj_id is None:
+        return []
+    key = (kind, obj_id, _queue_version())
+    hit = _ACTIVITY_CACHE.get(key)
+    if hit is not None:
+        return list(hit)
+    if kind == "deal":
+        fresh = list(dbmod.list_deal_activity(obj_id) or [])
+    else:
+        fresh = list(dbmod.list_activity(obj_id) or [])
+    _ACTIVITY_CACHE[key] = list(fresh)
+    return list(fresh)
+
+
+def _queue_version() -> int:
+    return _QUEUE_VERSION["v"]
+
+
+def _bump_queue_version():
+    """数据可能已变化时调用（新建/回复/任务/阶段变更后）。"""
+    _QUEUE_VERSION["v"] += 1
+    _LOAD_QUEUE_CACHE.clear()
+    _FU_OF_CUST_CACHE.clear()
+    _ACTIVITY_CACHE.clear()
+
+
 def load_queue(status=None):
-    """取出询盘并按优先级排好队，返回字典列表。"""
+    """取出询盘并按优先级排好队，返回字典列表。
+    ROUND 7.2 性能：同一轮 rerun 内 `load_queue(None)` 会被侧栏 / 首页 /
+    跟进台 / 详情等多处各调一次，每次都全量重算 need 派生 + AI Priority
+    （可测的侧栏切换卡顿来源之一）。这里加**轮次级缓存**：以
+    (status, 数据版本号) 为键，同一轮内重复调用直接复用同一份结果。
+    任何写操作（init_db / 新建询盘 / 回复 / 任务变更）都会 bump 版本号，
+    因此不会读到陈旧数据。
+    """
+    key = (status, _queue_version())
+    cached = _LOAD_QUEUE_CACHE.get(key)
+    if cached is not None:
+        return cached
     rows = list_inquiries(status)
     items = []
     for row in rows:
@@ -231,11 +292,53 @@ def load_queue(status=None):
             it["aip3"], it["qs3"] = None, None
         items.append(it)
     items.sort(key=lambda x: (-x["pts"], -x["id"]))
+    _LOAD_QUEUE_CACHE.clear()          # 只保留最近一个版本，避免无界增长
+    _LOAD_QUEUE_CACHE[key] = items
     return items
 
 init_db()
-backfill_opportunities()
-reconcile_duplicate_opportunities()
+# —— ROUND 7.2：启动期数据修复只在每个进程跑一次 ——
+# app.py 在模块顶层执行，Streamlit 每次 rerun（含每次侧栏点击）都会重跑
+# 整段脚本。backfill / reconcile 属于**一次性数据迁移**，不是渲染逻辑：
+#   · backfill_opportunities 旧版会把 10 条已吸附到 Deal 的往来永远判为
+#     「未关联」，每次 rerun 重跑 ~85ms（可测到的侧栏切换卡顿来源），
+#     并反复重写 details_json / updated_at；
+#   · reconcile_duplicate_opportunities 每次 rerun 全表扫描 + 分组。
+# 用模块级哨兵把这两步收敛到「本进程首次运行时」，行为对已有数据完全等价
+# （两次调用都幂等），但不再随每次交互重复付出成本。
+try:
+    if not globals().get("_STARTUP_MAINTENANCE_DONE"):
+        backfill_opportunities()
+        reconcile_duplicate_opportunities()
+        globals()["_STARTUP_MAINTENANCE_DONE"] = True
+except Exception:
+    # 数据维护失败不应阻断工作台渲染（与原行为一致：原代码也没有兜底）。
+    pass
+
+
+def _deal_identity_map(opportunities=None) -> dict:
+    """询盘 → Deal 权威身份键（来自商机记录）。
+
+    ROUND 6.9 §4：Deal 身份由源逻辑（商机层）决定。客户把同一个产品写成
+    不同短语、或把 5,000 修订成 3,000 时，商机层已经收敛为一条记录 ——
+    侧栏 / 首页 / 详情必须沿用同一把键，不允许再按每封询盘的产品文本各自
+    分组（那等于前端二次去重，同一个 Deal 会裂成多行）。
+
+    返回 {inquiry_id: ("deal", 客户键, 产品签名, "open"/"closed")}。
+    """
+    mapping = {}
+    opps = opportunities if opportunities is not None else (list_opportunities() or [])
+    for opp in opps:
+        key = _ui.deal_identity_of(opp)
+        if not key:
+            continue
+        details = opp.get("details") or {}
+        ids = [opp.get("inquiry_id"), details.get("current_inquiry_id")]
+        ids += list(details.get("related_inquiry_ids") or [])
+        for iid in ids:
+            if iid:
+                mapping[iid] = key
+    return mapping
 
 
 # 工具函数：供产品库按钮的 on_click 使用（必须在调用前定义）
@@ -1244,6 +1347,38 @@ div[data-testid="stExpander"] details { border-radius: 10px; }
 @media (min-width: 901px) {
   [data-testid="stSidebar"] { width: 292px; min-width: 292px; }
 }
+/* ROUND 6.8：CRM Sidebar = navigation + quick access，约 244px；折叠态窄 icon rail */
+@media (min-width: 901px) {
+  [data-testid="stSidebar"] { width: 244px !important; min-width: 244px !important; }
+}
+.sidebar-collapsed [data-testid="stSidebar"] { width: 62px !important; min-width: 62px !important; }
+.crm-side-title { font-size:.72rem; font-weight:850; color:var(--text-muted);
+  text-transform:uppercase; letter-spacing:.06em; margin:.55rem 0 .2rem; }
+.smart-view-row { display:flex; align-items:center; justify-content:space-between;
+  gap:.35rem; padding:.28rem .42rem; border-radius:8px; margin:.05rem 0;
+  font-size:.78rem; color:var(--text-secondary); }
+.smart-view-row .name { font-weight:750; color:var(--text-primary); }
+.smart-view-row .count { font-size:.68rem; font-weight:850; min-width:1.55rem;
+  text-align:center; border-radius:999px; background:#fff; border:1px solid var(--border-subtle);
+  padding:.02rem .32rem; color:var(--text-muted); }
+.smart-view-row.active { background:#EEF5FF; color:var(--brand-700); }
+.smart-view-row.active .name { color:var(--brand-700); }
+/* CRM 侧栏的 Smart Views 是导航，不是任务卡：保持稳定入口，但收紧为单行。 */
+[data-testid="stSidebar"] [data-testid="stButton"] > button[kind="secondary"] {
+  min-height:2rem; padding:.18rem .45rem; border-radius:8px; font-size:.78rem;
+}
+[data-testid="stSidebar"] [data-testid="stButton"] > button[kind="secondary"] p {
+  line-height:1.2;
+}
+/* Deal Quick Access：比旧卡更矮，隐藏 ID / message count / timestamp。 */
+.sq.deal { padding:.28rem .46rem .3rem; margin:.2rem 0 .06rem; border-radius:9px; }
+.sq.deal .co { font-size:.82rem; margin-top:.08rem; }
+.sq.deal .r2 { font-size:.68rem; margin-top:.08rem; }
+.sq.deal .meta { display:none; }
+.sq.deal .next { color:var(--brand-600); font-weight:650; }
+.quick-access-empty { color:var(--text-muted); font-size:.73rem; padding:.35rem .1rem; }
+.icon-rail-note { text-align:center; color:var(--text-muted); font-size:.7rem; margin:.3rem 0; }
+
 /* 队列列表区独立滚动的细节 */
 .queue-scroll [data-testid="stVerticalBlockBorderWrapper"] { margin-top: 0; }
 
@@ -1317,6 +1452,15 @@ div[data-testid="stVerticalBlock"]:has(> div[data-testid="stElementContainer"] .
 .deal-action-view .nba .lb { font-size:.66rem; color:var(--brand-600); font-weight:850; }
 .deal-action-view .nba .what { font-size:1rem; font-weight:850; margin:.08rem 0; }
 .deal-action-view .nba .why { font-size:.78rem; color:var(--text-secondary); line-height:1.45; }
+/* ROUND 7.1 §14：Deal Progression 只读展示行（Health / Aging / Next Activity / 建议迁移） */
+.deal-action-view .prog { font-size:.76rem; color:var(--text-secondary);
+  margin-top:.34rem; padding-top:.32rem; border-top:1px dashed rgba(148,163,184,.35); }
+.deal-action-view .prog b { font-size:.66rem; color:var(--brand-600); font-weight:850;
+  letter-spacing:.04em; margin-right:.3rem; }
+.deal-action-view .prog.tr { border-top:none; margin-top:.16rem;
+  padding:.3rem .5rem; border-radius:7px; background:rgba(59,130,246,.06);
+  color:var(--text-primary); font-size:.78rem; font-weight:650; }
+.deal-action-view .prog.tr .hint { font-size:.7rem; color:var(--text-tertiary); font-weight:500; }
 .req-compact { background:#fff; border:1px solid var(--border-subtle); border-radius:12px;
   padding:.68rem .8rem; margin:.56rem 0 .38rem; box-shadow:var(--shadow-card); }
 .req-compact .title, .timeline-compact .title { font-size:.78rem; font-weight:850; margin-bottom:.38rem; }
@@ -1537,6 +1681,11 @@ button[kind="tertiary"]:hover { color: var(--brand-600); }
 [data-testid="stSidebar"] { background: #EEF2F7; }
 .workspace-section { margin: .8rem 0 .42rem; display:flex; align-items:baseline; gap:.55rem; }
 .workspace-section .title { font-size: 1rem; font-weight: 800; color: var(--text-primary); }
+.today-action-row { padding:.48rem 0 .52rem; border-bottom:1px solid var(--border-subtle); }
+.today-action-row .action { font-size:.94rem; font-weight:800; color:var(--text-primary); line-height:1.28; }
+.today-action-row .deal { font-size:.77rem; color:var(--text-secondary); margin-top:.12rem;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.today-action-row .why { font-size:.7rem; color:var(--text-muted); margin-top:.12rem; }
 .workspace-section .note { font-size: .74rem; color: var(--text-muted); }
 .workspace-section.compact { margin-top: .55rem; }
 .workspace-kpi { background: var(--surface-1); border: 1px solid var(--border-subtle);
@@ -1582,6 +1731,40 @@ button[kind="tertiary"]:hover { color: var(--brand-600); }
 .pipeline-pill .n { font-weight:800; font-size:.88rem; }.pipeline-pill .l { font-size:.65rem; color:var(--text-muted); }
 .inbox-nav { font-size:.76rem; font-weight:800; color:var(--text-secondary); margin:.55rem 0 .18rem; letter-spacing:.03em; }
 .saved-view { font-size:.7rem; color:var(--text-muted); padding:.18rem 0; }
+/* —— ROUND 6.9 §2 · 跟进卡（默认 3 行：客户 / 产品·数量 / 到期·下一步）—— */
+.fucard { line-height:1.45; }
+.fucard .r1 { display:flex; justify-content:space-between; align-items:baseline; gap:.5rem; }
+.fucard .r1 b { font-size:.9rem; }
+.fucard .r1 .st { font-size:.7rem; font-weight:750; white-space:nowrap; }
+.fucard .r2 { font-size:.78rem; color:var(--text-primary); margin-top:.1rem; }
+.fucard .r3 { font-size:.72rem; color:var(--text-secondary); margin-top:.12rem; }
+/* —— ROUND 6.9 §1 · Pipeline 概览卡（只读，点卡片进 Deal Detail）—— */
+.phead { font-size:.74rem; font-weight:800; color:var(--text-secondary);
+  padding:.3rem .1rem .35rem; border-bottom:1px solid var(--border-subtle);
+  margin-bottom:.4rem; display:flex; justify-content:space-between; }
+.phead span { color:var(--text-muted); font-weight:700; }
+.pcard { border:1px solid var(--border-subtle); border-left:3px solid var(--text-disabled);
+  border-radius:9px; padding:.45rem .55rem; margin-bottom:.4rem;
+  background:var(--surface-2); cursor:pointer; }
+.pcard.healthy { border-left-color:var(--success); }
+.pcard.attention { border-left-color:var(--warning); }
+.pcard.at_risk, .pcard.overdue { border-left-color:var(--danger); }
+.pcard .co { font-size:.82rem; font-weight:750; line-height:1.3;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.pcard .pd { font-size:.72rem; color:var(--text-secondary); margin-top:.12rem;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.pcard .amt { font-size:.78rem; font-weight:700; margin-top:.22rem; }
+.pcard .meta { font-size:.68rem; color:var(--text-muted); margin-top:.1rem; }
+/* ROUND 7.1 §11 · Primary Reason 一行业务原因（比 meta 略重，但仍是次级） */
+.pcard .rsn { font-size:.69rem; color:var(--text-secondary); margin-top:.14rem;
+  line-height:1.35; display:-webkit-box; -webkit-line-clamp:2;
+  -webkit-box-orient:vertical; overflow:hidden; }
+.pcard .nx { font-size:.68rem; color:var(--brand-600); margin-top:.16rem;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+/* 逾期/缺失是执行例外，必须一眼可见（颜色语义与全站一致：红=紧迫） */
+.pcard .nx.od { color:var(--danger); font-weight:700; }
+.pcard .nx.miss { color:var(--warning); font-weight:650; }
+.pcard .nx.tr { color:var(--text-muted); font-weight:600; }
 @media (max-width: 900px) { .block-container { padding-left:.7rem; padding-right:.7rem; }
   .workspace-kpi { min-height:70px; padding:.42rem .55rem; }
 }
@@ -1647,10 +1830,60 @@ def _workspace_reason(item: dict) -> list[str]:
     return lines[:3]
 
 
+def _record_recent_deal_access(iid: int):
+    """记录一次 Deal 访问；渲染层再按 canonical Deal identity 去重。"""
+    if not iid:
+        return
+    recent = [x for x in st.session_state.get("recent_opened_inquiry_ids", [])
+              if str(x) != str(iid)]
+    st.session_state.recent_opened_inquiry_ids = [iid] + recent[:11]
+
+
 def _home_select_inquiry(iid: int):
-    """首页/Inbox 的处理入口复用既有详情状态，避免无反馈点击。"""
+    """统一打开 Deal：切换详情并记录一次最近访问。
+
+    最近访问只保存代表询盘 ID；侧栏渲染时再按 Deal identity 聚合，避免同一
+    Deal 的多封往来在侧栏变成多张卡。该状态纯 UI，不写入 CRM 数据。
+    """
     _open_inquiry(iid)
     st.session_state.home_opened_id = iid
+    _record_recent_deal_access(iid)
+
+
+def _home_execute_resolved_action(iid: int, action: str):
+    """首页行动队列复用 Deal Detail 的既有主 CTA 路由。
+
+    这里不派生新动作：action 与按钮文案都来自 ResolvedDealState。首页只负责
+    把用户带到相同的执行区域，确保首页、详情与 Pipeline 不会出现不同 CTA。
+    """
+    _home_select_inquiry(iid)
+    if action in ("PREPARE_QUOTATION", "UPDATE_QUOTATION",
+                  "CHECK_INTERNAL_QUOTATION_PREREQUISITES",
+                  "PREPARE_UPDATED_QUOTATION"):
+        section_key = f"ui_quote_{iid}"
+    elif action == "FOLLOW_UP":
+        section_key = f"ui_fuzone_{iid}"
+    elif action in ("MATCH_PRODUCT", "CHECK_SUPPLIER_CAPABILITY",
+                    "CHECK_PRODUCT_OPTIONS", "PREPARE_PRODUCT_RECOMMENDATION"):
+        section_key = None
+    else:
+        section_key = f"ui_mail_{iid}"
+    _execute_primary_action(iid, action, section_key)
+
+
+def _open_deal_from_pipeline(inquiry_id):
+    """ROUND 6.9 §1：Pipeline 卡片 → 共享 Deal Detail。
+
+    不再复制一套 Pipeline 专属详情面板：直接复用其它工作区同一个
+    Deal Detail（选中该 Deal 的代表询盘），保证全站只有一个详情定义。
+    """
+    if not inquiry_id:
+        st.toast("该商机尚未关联询盘，暂时无法打开 Deal Detail")
+        return
+    _open_inquiry(inquiry_id)
+    _record_recent_deal_access(inquiry_id)
+    st.session_state.home_opened_id = None
+    st.session_state.pipeline_opened_id = inquiry_id
 
 
 def _render_task_card(item: dict, label: str, tone: str, key_prefix: str):
@@ -1833,10 +2066,14 @@ def _fu_render_detail(item):
     with _w2:
         st.markdown(f"**Reason**　{_fu.REASON_CN.get(item['reason'], item['reason'])}")
     # LAST ACTIVITY
+    # ROUND 7.2 性能：跟进台（tab2）与客户档案（tab4）都随每次 rerun 重跑，
+    # 而 _fu_load_items() 会先把全部任务行 join 出来（单轮 16 次调用），
+    # 再在卡片循环里为每条任务各查一次活动流 —— 侧栏点一下就白跑一遍。
+    # 活动流按 (inquiry_id / deal_id, 数据版本) 缓存，写路径 bump 版本即失效。
     acts = []
     if item.get("inquiry_id"):
-        acts = list(_db3.list_activity(item["inquiry_id"]) or [])
-    dacts = _db3.list_deal_activity(item["deal_id"]) or [] if item.get("deal_id") else []
+        acts = _cached_activity(_db3, "inquiry", item["inquiry_id"])
+    dacts = _cached_activity(_db3, "deal", item["deal_id"]) if item.get("deal_id") else []
     acts += [("Deal", a.get("ts"), a.get("description") or a.get("type"), "", "")
              for a in dacts]
     if acts:
@@ -1989,34 +2226,40 @@ def _render_followup_workspace():
         st.caption("✓ 暂无需要处理的跟进 —— 空间留给真正需要你的客户。")
     for _it in _fitems:
         _tone, _st_cn = _fu_reason_badge(_it)
-        _need = _it["product"] or "—"
-        _line = " · ".join(x for x in (str(_need), str(_it["qty"] or "")) if x)
+        # ROUND 6.9 §2：默认卡只回答四件事 —— 谁 / 什么产品与数量 /
+        # 什么时候到期（含逾期）/ 下一步做什么，外加一个主 CTA。
+        # 邮件编辑器、完成、Snooze、改期、时间轴全部收进展开抽屉，
+        # 卡片高度比原来下降约 40%，队列可以一屏扫完。
+        _key = f"fuid_{_it['id'] or ('a' + str(_it['deal_id']) + _it['reason'])}"
+        _open_key = f"fu_open_{_key}"
         _dot = {"red": "🔴", "amber": "🟠", "blue": "🔵", "green": "🟢",
                 "low": "⚪"}.get(_tone, "⚪")
-        _stage_cn = _crm_core.STAGE_CN.get(_it.get("stage") or "",
-                                           str(_it.get("stage") or ""))
-        _pri = _it.get("pri") or "P2"
+        _line = " · ".join(x for x in (str(_it["product"] or ""),
+                                       str(_it["qty"] or "")) if x) or "产品待补充"
+        _due = str(_it.get("due_at") or "未设时间")[:16]
+        _due_tone = {"red": "var(--danger)", "amber": "var(--warning)"}.get(
+            _tone, "var(--text-secondary)")
         with st.container(border=True):
             st.markdown(
-                f"<div style='display:flex;justify-content:space-between;gap:.5rem'>"
-                f"<div><span style='font-weight:800'>{_pri}</span> · "
-                f"<span style='color:"
-                f"{'var(--danger)' if _tone == 'red' else ('var(--warning)' if _tone == 'amber' else 'var(--text-secondary)' )}'>"
-                f"{_dot} {_st_cn}</span>　"
-                f"<b>{_ui_flag_esc(_it['company'] or _it['deal_title'] or '未知客户')}</b></div>"
-                f"<div style='font-size:.72rem;opacity:.6'>#{_it['deal_id']} · Deal</div></div>"
-                f"<div style='font-size:.85rem;margin:.2rem 0'>"
-                f"{_ui_flag_esc(_line)}</div>"
-                f"<div style='font-size:.8rem;color:var(--text-secondary)'>"
-                f"{_fu.REASON_WHY.get(_it['reason'], _it['reason'])}</div>"
-                f"<div style='font-size:.8rem;margin:.25rem 0 0'>"
-                f"<b>AI 下一步</b>：{_ui_flag_esc(_it['nba'])}"
-                f"　·　阶段 {_ui_flag_esc(_stage_cn)}"
-                f"　·　到期 {str(_it['due_at'] or '未设')[:16]}</div>",
-                unsafe_allow_html=True)
-            with st.expander("查看 / 处理（详情 + 邮件 + 完成 + Snooze）",
-                             expanded=False):
-                _fu_render_detail(_it)
+                f"<div class='fucard {_tone}'>"
+                f"<div class='r1'><b>{_ui_flag_esc(_it['company'] or _it['deal_title'] or '未知客户')}</b>"
+                f"<span class='st'>{_dot} {_st_cn}</span></div>"
+                f"<div class='r2'>{_ui_flag_esc(_line)}</div>"
+                f"<div class='r3'><span style='color:{_due_tone};font-weight:700'>{_due}</span>"
+                f"　·　{_ui_flag_esc(str(_it['nba']))}</div>"
+                f"</div>", unsafe_allow_html=True)
+            _cc = st.columns([1.05, 1.35])
+            with _cc[0]:
+                if st.button("✉️ 生成客户邮件", key=f"fu_cta_{_key}", type="primary",
+                             use_container_width=True,
+                             help="打开统一的客户邮件编辑器（自动判断邮件目的）"):
+                    st.session_state[f"fu_gen_{_key}"] = True
+                    st.session_state[_open_key] = True
+                    st.rerun()
+            with _cc[1]:
+                with st.expander("处理（邮件 · 完成 · 稍后 · 详情）",
+                                 expanded=bool(st.session_state.get(_open_key))):
+                    _fu_render_detail(_it)
     # —— 手动创建跟进 ——
     with st.expander("➕ 手动创建跟进", expanded=False):
         _m_d = st.selectbox("商机 Deal", [f"#{o['id']} {o['title']}"
@@ -2565,6 +2808,324 @@ def resolve_deal_state(deal_id: int) -> dict:
 resolveDealState = resolve_deal_state
 
 
+# ==========================================================================
+# ROUND 6.9 §5 · 统一客户邮件（第二十一轮单管线）
+#   Deal Detail 是唯一共享详情页 —— 编写器必须在该页可达。
+#   旧版把这段留在 _render_customer_workspace 的 return 之后（废弃分支），
+#   导致所有「生成客户邮件」CTA 打开的是空区域。此处为其唯一实现（MOVE）。
+# ==========================================================================
+def _build_customer_mail_ctx(id_, text, info, matches, gaps, insight,
+                             r_stat, biz, draft):
+    """统一客户邮件上下文（意图自动判定 + 单生成管线，口径不变）。"""
+    info = info or {}
+    matches = matches or []
+    gaps = gaps or []
+    insight = insight or {}
+    text = text or ""
+    draft = draft if isinstance(draft, str) else ""
+    r_stat = r_stat or ""
+    biz = biz or ""
+    # —— 第二十一轮：统一客户邮件上下文（意图自动判定 + 单生成管线）——
+    # 业务员不再需要在“追问 / 回复 / 跟进”之间选；系统按当前状态自动判断。
+    _mail_product = ""
+    try:
+        _mail_product = ((insight.get("product_match") or {}).get("customer_product")
+                         or info.get("product_query") or "")
+        if not _mail_product:
+            from agent.extractor import extract_customer_product
+            _mail_product = extract_customer_product(text) or ""
+    except Exception:
+        pass
+    _fu_reason = ""
+    if id_ is not None:
+        try:
+            _m_opps = [o for o in (list_opportunities() or [])
+                       if o.get("inquiry_id") == id_]
+            if _m_opps:
+                for _mt in _db_mod.list_followup_tasks(
+                        opportunity_id=_m_opps[-1]["id"]) or []:
+                    if _mt.get("fu_status") not in ("COMPLETED", "CANCELLED"):
+                        _fu_reason = _mt.get("reason") or _fu_reason
+        except Exception:
+            pass
+    _mail_ctx = dict(
+        text=text, info=info, matches=matches, gaps=gaps,
+        stored_draft=draft or "", customer_product=_mail_product,
+        seller_company=(SELLER.get("company") or ""),
+        biz=biz,
+        resolved_state=(resolve_deal_state(id_).get("resolvedState") if id_ is not None else {}),
+        quotation_ready=(r_stat in ("READY_FOR_QUOTATION", "ready_for_quotation")),
+        fu_reason=_fu_reason,
+        known=[k for k, v in info.items()
+               if k in ("email", "company", "website") and v],
+        unresolved=[m.get("name", "") for m in gaps
+                    if m.get("ask_timing") == "ASK_NOW"][:5],
+        insight=insight,
+    )
+    try:
+        _mail_intent, _mail_why = _emu.determine_email_intent(_mail_ctx)
+    except Exception:
+        _mail_intent, _mail_why = _emu.REPLY_INQUIRY, "按当前状态回复客户。"
+    return _mail_ctx
+
+
+def _render_deal_closure(id_, biz, wf=None):
+    """回复闭环：设置跟进时间 + 人工确认结单（成交 / 丢单）。
+
+    ROUND 6.9 §5：与统一邮件编写器同属 Deal Detail 的执行闭环，
+    必须与「生成客户邮件」在同一页可达（fuset_ / deal_won_ 键不变）。
+    """
+    biz = biz or ""
+    # 说明：wf 为工作流字段 dict（数据），状态机判断统一走 workflow 模块函数
+    _ = wf
+    if id_ is None:
+        return
+    if id_ is not None and biz in ("REPLIED", "FOLLOW_UP", "QUOTED",
+                                        "NEGOTIATING", "READY_FOR_QUOTE"):
+        with st.expander("创建跟进", expanded=st.session_state.get(f"ui_fuzone_{id_}", False)):
+            st.selectbox("跟进时间", FU_OPTIONS, key=f"compact_fu_pick_{id_}", index=1)
+            if st.button("⏰ 设置跟进", key=f"fuset_{id_}",
+                         use_container_width=True, type="primary"):
+                st.session_state[f"fu_pick_{id_}"] = st.session_state.get(f"compact_fu_pick_{id_}")
+                _do_set_followup(id_)
+                st.rerun()
+
+    if id_ is not None and biz in ("WON", "LOST"):
+        st.success("已成交，恭喜！" if biz == "WON" else "已标记丢单（可在跟进中复盘原因）")
+    elif id_ is not None and _wf.can_transition(biz, "WON"):
+        with st.expander("结单（成交 / 丢单 · 需人工确认）", expanded=False):
+            _deal_ok = st.checkbox("我确认这是最终业务结果", key=f"deal_ok_{id_}")
+            _dc1, _dc2 = st.columns(2)
+            with _dc1:
+                st.button("标记成交", key=f"deal_won_{id_}",
+                          use_container_width=True, disabled=not _deal_ok,
+                          on_click=_do_mark_deal, args=(id_, "WON"))
+            with _dc2:
+                st.button("标记丢单", key=f"deal_lost_{id_}",
+                          use_container_width=True, disabled=not _deal_ok,
+                          on_click=_do_mark_deal, args=(id_, "LOST"))
+
+
+
+def _render_deal_pipeline(id_, biz, biz_cn, act, fu_state, fu_at, st_blockers):
+    """Deal Detail ② Pipeline：阶段知识卡 + 受状态机约束的阶段推进。
+
+    ROUND 6.9 §5：与统一邮件编写器 / 跟进 / 结单同属 Deal Detail 的执行闭环，
+    必须与它们在同一页可达（ws_pipe_* 键与状态机判断完全不变）。
+    """
+    act = act or {}
+    st_blockers = st_blockers or []
+    fu_state = fu_state or ""
+    biz = biz or ""
+    biz_cn = biz_cn or ""
+    _fu_at = fu_at or ""
+    import html as _h
+    # ========== ② Pipeline（真实状态 + 点击查看阶段知识 + 推进） ==========
+    _fpos = _crm.funnel_position(biz)
+    _pipe_html = "<div class='pipe-line'>"
+    for _i, (_sn, _sk) in enumerate(_crm.FUNNEL):
+        if _fpos >= 0 and _i < _fpos:
+            _cls = "done"
+        elif _i == _fpos:
+            _cls = "cur"
+        elif _i == 6:
+            _cls = "won"
+        else:
+            _cls = ""
+        _pipe_html += (f"<span class='pchip {_cls}'>"
+                       + ("✓ " if _cls == "done" else "" if _cls != "cur" else "● ")
+                       + f"{_sn}</span>")
+        if _i < len(_crm.FUNNEL) - 1:
+            _pipe_html += "<span class='pipe-arw'>→</span>"
+    if biz == "LOST":
+        _pipe_html += "<span class='pipe-arw'>→</span><span class='pchip lost'>⚫ LOST 已丢单（可复活到谈判）</span>"
+    elif biz == "ON_HOLD":
+        _pipe_html += "<span class='pipe-arw'>→</span><span class='pchip lost'>⏸ 暂缓中</span>"
+    elif biz == "WON":
+        _pipe_html += "<span class='pipe-arw'>→</span><span class='pchip won'>🏆 已成交</span>"
+    _pipe_html += "</div>"
+
+    with st.container(border=True):
+        _pd = st.columns([1.2, 6.6])
+        with _pd[0]:
+            st.markdown("<div style='font-size:.92rem;font-weight:800'>销售漏斗 Pipeline</div>",
+                        unsafe_allow_html=True)
+        with _pd[1]:
+            st.markdown(_pipe_html, unsafe_allow_html=True)
+        # 点击阶段 → 看「进入条件 / 缺失信息 / AI建议 / 完成条件」（真实状态驱动）
+        _pipe_opts = list(_wsx.FUNNEL_CN)
+        _cur_cn = (_wsx.FUNNEL_CN[_fpos] if 0 <= _fpos < 7 else None)
+        _sel_i = st.segmented_control(
+            "查看阶段", _pipe_opts,
+            default=_cur_cn if _cur_cn else None,
+            key=f"ws_pipe_{id_}",
+            help="点击任一阶段查看：进入条件 / 当前缺失信息 / AI 建议 / 完成条件；"
+                 "可推进到目标阶段（受状态机约束）")
+        _sel_cn = _sel_i or _cur_cn
+        _sel_idx = _pipe_opts.index(_sel_cn) if _sel_cn in _pipe_opts else -1
+        if 0 <= _sel_idx < 7:
+            # 阶段知识卡（静态）
+            st.markdown(_wsx.stage_knowledge_html(_sel_idx), unsafe_allow_html=True)
+            # 缺失信息（真实 blockers / 跟进逾期，不编造）
+            _miss_parts = []
+            if st_blockers:
+                _miss_cn = "、".join(_field_cn(f) for f in st_blockers[:4])
+                _miss_parts.append(f"阻塞项 {len(st_blockers)} 项：{_miss_cn}")
+            if fu_state == "已逾期":
+                _miss_parts.append(f"跟进已逾期（原计划 {_fu_at or '—'}）")
+            elif fu_state == "今日跟进":
+                _miss_parts.append("今日到期需跟进")
+            _miss_txt = "；".join(_miss_parts) if _miss_parts else "暂无阻塞（关键信息齐全）"
+            st.markdown(
+                f"<div class='pipe-know'><div class='pk-row'>"
+                f"<span class='pk-lb gap'>缺失信息</span><span>{_h.escape(_miss_txt)}</span>"
+                "</div></div>", unsafe_allow_html=True)
+            # AI 建议下一步（复用 workflow 口径）
+            _act_txt = (act.get("label") or "等待客户反馈")
+            _act_p = (act.get("priority") or "")
+            st.markdown(
+                f"<div class='pipe-know'><div class='pk-row'>"
+                f"<span class='pk-lb ai'>AI 建议</span><span>"
+                f"<b>{_h.escape(_act_txt)}</b>"
+                + (f"（优先级 {_h.escape(_act_p)}）" if _act_p else "") + "</span></div></div>",
+                unsafe_allow_html=True)
+            # 推进动作（真实状态机：目标段映射 biz，WON 走人工结单）
+            _target = _wsx.STAGE_TARGET_BIZ[_sel_idx]
+            _allow = _target != "WON" and _wf.can_transition(biz, _target)
+            _btn_c1, _btn_c2 = st.columns([1.1, 4])
+            with _btn_c1:
+                if _sel_idx == _fpos and biz not in ("LOST", "ON_HOLD"):
+                    st.button("已在本阶段", key=f"ws_pipe_cur_{id_}",
+                              disabled=True, use_container_width=True)
+                elif _target == "WON":
+                    st.button(f"推进到「{_sel_cn}」", key=f"ws_pipe_won_{id_}",
+                              disabled=True, use_container_width=True,
+                              help="成交需人工确认：请在下方「🏁 结单」区操作")
+                elif _allow:
+                    st.button(f"推进到「{_sel_cn}」", key=f"ws_pipe_go_{id_}",
+                              use_container_width=True, type="primary",
+                              on_click=_do_set_stage, args=(id_, _target),
+                              help="写入真实销售阶段并记入 Timeline")
+                else:
+                    st.button(f"推进到「{_sel_cn}」", key=f"ws_pipe_no_{id_}",
+                              disabled=True, use_container_width=True,
+                              help="状态机不允许跳变，需按流程逐步推进")
+            with _btn_c2:
+                if _sel_idx == _fpos and biz in ("LOST", "ON_HOLD"):
+                    _extra_note = ("已丢单：可先推进到「谈判」复活" if biz == "LOST"
+                                   else "暂缓中：恢复请先推进到其它活跃阶段")
+                    st.caption(_extra_note)
+                elif not _allow and _target != "WON":
+                    st.caption(f"状态机不允许从「{biz_cn}」直接跳到「{_sel_cn}」。"
+                               "请按销售流程逐步推进（或用右下阶段下拉退到暂缓再调整）。")
+                elif _target == "WON":
+                    st.caption("成交 = 最终业务结果，必须人工确认（AI 不自动判成交）。")
+                else:
+                    st.caption("点击后将更新真实销售阶段（Current Stage 随之变化）并记录一条 Timeline。")
+            _smsg = st.session_state.get(f"stage_msg_{id_}")
+            if _smsg:
+                st.caption(_smsg)
+        else:
+            st.caption("该询盘当前不在七段主流程中（丢单/暂缓），阶段知识卡仅对活跃流程展示。")
+
+def _render_customer_email_composer(id_, mail_ctx, biz, draft_text=""):
+    """渲染「✉️ 生成客户邮件」唯一编写器（人工复核后才可标记发送）。
+
+    draft_box_{rk} / mark_replied_{id_} 沿用既有 key 约定：
+    保存草稿与确认发送的闭环（update_draft / _mark_replied）完全复用。
+    """
+    _rk = id_ if id_ is not None else "new"
+    draft = draft_text or ""
+    biz = biz or ""
+    _mail_intent = mail_ctx.get("mail_intent") or _emu.REPLY_INQUIRY
+    _mail_why = mail_ctx.get("mail_intent_why") or "按当前状态回复客户。"
+    # —— 第二十一轮：统一客户邮件 Composer（追问/回复/报价/跟进共用一套）——
+    # 显示：邮件目的（自动判断）→ Subject → Body → 重新生成 / 编辑 / 保存草稿 /
+    # 确认发送（人工复核后手动确认，绝不自动外发）。草稿 key 沿用 draft_box_{rk}，
+    # 保存/回复闭环与既有 update_draft / _mark_replied 完全一致。
+    if id_ is not None and f"mail_seeded_{_rk}" not in st.session_state:
+        try:
+            _mres0 = _emu.generate_customer_email(mail_ctx, intent="AUTO")
+        except Exception as _me:
+            _mres0 = {"body": draft or "", "subject": "", "issues": [str(_me)[:80]],
+                      "intent": _emu.REPLY_INQUIRY, "intent_cn": "回复客户",
+                      "reason": ""}
+        st.session_state[f"mail_subject_{_rk}"] = _mres0.get("subject") or ""
+        st.session_state[f"draft_box_{_rk}"] = _mres0.get("body") or ""
+        st.session_state[f"mail_res_{_rk}"] = _mres0
+        st.session_state[f"mail_seeded_{_rk}"] = True
+    _exp_mail = st.session_state.get(f"ui_mail_{_rk}", False)
+    with st.expander("✉️ 生成客户邮件（邮件目的自动判断 · 草稿不自动发送）",
+                     expanded=_exp_mail):
+        if id_ is None:
+            st.caption("分析保存后即可生成统一客户邮件。")
+        else:
+            _sel_codes = [c for c, _ in _emu.SELECT_OPTIONS]
+            _sel_map = dict(_emu.SELECT_OPTIONS)
+            _cur_sel = st.session_state.get(f"mail_sel_{_rk}", "AUTO")
+            if _cur_sel not in _sel_map:
+                _cur_sel = "AUTO"
+            _cA, _cB = st.columns([2.6, 1], gap="small")
+            with _cA:
+                _choice = st.selectbox(
+                    "邮件目的（默认自动判断）", _sel_codes,
+                    index=_sel_codes.index(_cur_sel),
+                    key=f"mail_sel_{_rk}",
+                    format_func=lambda c: {"AUTO": "自动（推荐）"}.get(c, _sel_map[c]),
+                    help="自动=按询盘状态/商机阶段/跟进原因判定；也可人工指定类型。")
+                if _choice == "AUTO":
+                    st.caption(f"🎯 系统判断邮件目的：{_emu.INTENT_CN.get(_mail_intent, _mail_intent)}"
+                               f"　—　{_mail_why}")
+                else:
+                    st.caption(f"已指定邮件目的：{_sel_map.get(_choice, _choice)}"
+                               "（点「重新生成」应用）")
+            with _cB:
+                _mres = st.session_state.get(f"mail_res_{_rk}") or {}
+                _m_issues = st.session_state.get(f"mail_issues_{_rk}") or _mres.get("issues") or []
+                st.caption("安全策略：无验证不承诺 · 问句 ≤3 · 不索取已知信息 · 不自动发送")
+            if st.button("🔁 重新生成（按所选邮件目的）", key=f"mail_regen_{_rk}",
+                         use_container_width=False):
+                _nres = _emu.generate_customer_email(mail_ctx,
+                                                     intent=_choice)
+                st.session_state[f"mail_subject_{_rk}"] = _nres.get("subject") or ""
+                st.session_state[f"draft_box_{_rk}"] = _nres.get("body") or ""
+                st.session_state[f"mail_res_{_rk}"] = _nres
+                st.session_state[f"mail_issues_{_rk}"] = _nres.get("issues") or []
+                st.toast(f"已按「{_nres.get('intent_cn')}」重新生成草稿")
+                st.rerun()
+            if _m_issues:
+                st.warning("**HUMAN REVIEW REQUIRED** 邮件含未经公司知识库验证的内容，"
+                           "仅可人工复核后手动发送：\n\n"
+                           + "\n".join("- " + str(i) for i in _m_issues[:5]))
+            st.text_input("Subject", key=f"mail_subject_{_rk}")
+            st.text_area("客户邮件草稿（可编辑 · 发送前人工复核）",
+                         key=f"draft_box_{_rk}", height=200,
+                         label_visibility="collapsed")
+            _c1, _c2, _c3, _c4 = st.columns([1, 1, 1.6, 1], gap="small")
+            with _c1:
+                st.download_button("⬇️ 下载 txt",
+                                   st.session_state.get(f"draft_box_{_rk}", ""),
+                                   file_name="customer_email.txt",
+                                   key=f"mail_dl_{_rk}", use_container_width=True)
+            with _c2:
+                if st.button("💾 保存草稿", key=f"mail_save_{_rk}",
+                             use_container_width=True,
+                             help="保存修改到该询盘草稿并记入 Timeline"):
+                    _ws_save_draft(id_)
+            with _c3:
+                if biz not in ("REPLIED", "FOLLOW_UP", "QUOTED", "NEGOTIATING",
+                                    "WON", "LOST", "ON_HOLD"):
+                    if st.button("📤 确认发送（人工复核后手动确认）",
+                                 key=f"mark_replied_{id_}", type="primary",
+                                 use_container_width=True,
+                                 help="只标记为已发送并推进状态，系统不会自动外发"):
+                        _mark_replied(id_)
+                        st.toast("已标记为已发送，下一步可设置跟进时间")
+                        st.rerun()
+            st.caption("ℹ️ 发送前请人工复核：本工作台从不自动发送邮件。"
+                       "「保存草稿」与「确认发送」都会写入 Timeline。")
+
+
 def _render_customer_workspace(ctx):
     """Phase 2 · Customer + Opportunity Workspace 主渲染。
 
@@ -2743,6 +3304,43 @@ def _render_customer_workspace(ctx):
         _recent = "暂无活动记录"
     _cta_label = _resolved.get("primaryCta") or _hero_what
     _priority_text = str(_resolved.get("priority") or ctx.get("g_letter") or "—")
+    # —— ROUND 7.1 §14：AI 销售助手消费 Deal Progression Engine 的输出 ——
+    #   助手不再自己推导"健康/停留/下一步"，只展示 domain 层的解析结果。
+    #   仍然保留原有四段结构（当前状态 / 下一步 / 原因 / 主 CTA），
+    #   额外补充：Deal Health、Stage Aging、Next Activity、推荐的阶段迁移。
+    _prog = {}
+    try:
+        _prog = _pg.progression_of(id_)
+    except Exception:
+        _prog = {}
+    _pg_health_cn = _prog.get("health_cn") or ""
+    _pg_health_icon = _prog.get("health_icon") or ""
+    _pg_age = _prog.get("stage_age_text") or ""
+    _pg_reason = _prog.get("primary_reason") or ""
+    _pg_next = _prog.get("card_next") or ""
+    _pg_na_status = _prog.get("next_activity_status") or ""
+    _pg_na_cn = _prog.get("next_activity_status_cn") or ""
+    _pg_trans = _prog.get("recommended_transition_cn") or ""
+    _pg_trans_reason = _prog.get("transition_reason") or ""
+    _pg_health_row = ""
+    if _pg_health_cn:
+        _age_bit = f"　·　{_h.escape(_pg_age)}" if _pg_age and _pg_age != "今天" else ""
+        _na_bit = ""
+        if _pg_na_cn and _pg_na_status not in ("", "CLOSED"):
+            _na_tone = " style='color:var(--danger);font-weight:700'" \
+                if _pg_na_status == "OVERDUE" else (
+                    " style='color:var(--warning);font-weight:650'"
+                    if _pg_na_status in ("MISSING", "DUE_TODAY") else "")
+            _na_bit = f"　·　下一步<span{_na_tone}>{_h.escape(_pg_na_cn)}</span>"
+        _pg_health_row = (
+            f"<div class='prog'><b>Deal Health</b> {_pg_health_icon} "
+            f"{_h.escape(_pg_health_cn)}{_age_bit}{_na_bit}</div>")
+    # 推荐阶段迁移：只提示，不自动执行（§9）；原因走「为什么?」
+    _pg_trans_row = ""
+    if _pg_trans:
+        _pg_trans_row = (
+            f"<div class='prog tr'>建议推进至 {_h.escape(_pg_trans)}"
+            f"　<span class='hint'>（需人工确认）</span></div>")
     st.markdown(
         "<div class='deal-action-view'>"
         "<div class='assistant-title'>AI销售助手</div>"
@@ -2752,10 +3350,12 @@ def _render_customer_workspace(ctx):
         f"<div class='state'><span>状态</span><b>{_h.escape(biz_cn)}</b>"
         f"<span>{_h.escape(fu_state or _rq_txt or '正常推进')}</span></div>"
         "</div>"
-        "<div class='nba'><div class='lb'>下一步</div>"
+        + _pg_health_row
+        + "<div class='nba'><div class='lb'>下一步</div>"
         f"<div class='what'>{_h.escape(_hero_what)}</div>"
-        f"<div class='why'>原因：{_h.escape(_hero_why)}</div></div>"
-        "</div>",
+        f"<div class='why'>原因：{_h.escape(_pg_reason or _hero_why)}</div></div>"
+        + _pg_trans_row
+        + "</div>",
         unsafe_allow_html=True)
     _av1, _avwhy, _av2 = st.columns([1.25, .9, 2.1], gap="small")
     with _av1:
@@ -2862,6 +3462,27 @@ def _render_customer_workspace(ctx):
         st.caption(f"客户：{_co_name or _ct_name or '未知客户'} · 联系人：{_ct_name or '—'} · 邮箱：{known_email or info.get('email') or '—'} · 国家：{info.get('country') or '—'}")
         if st.session_state.get(f"ui_src_{id_}"):
             st.code(str(info.get("raw_text") or "").strip() or "当前记录未保留原文。")
+
+    # —— 第二十一轮统一客户邮件编写器（ROUND 6.9 §5：放回共享 Deal Detail）——
+    # 首页 / 侧栏 / 商机页 / 跟进台的所有「生成客户邮件」CTA 都指向
+    # ui_mail_{id_}；编写器必须在本页可达，否则 CTA 打开的是空区域。
+    if not _term:
+        try:
+            _render_deal_pipeline(id_, biz, ctx.get("biz_cn") or "", act,
+                                  fu_state, _fu_at, st_blockers)
+        except Exception as _pce:
+            st.caption(f"Pipeline 暂不可用：{str(_pce)[:80]}")
+        try:
+            _mail_ctx = _build_customer_mail_ctx(
+                id_, ctx.get("text") or "", info, matches,
+                ctx.get("gaps") or [], insight,
+                r_stat, biz, ctx.get("draft_text") or "")
+            _render_customer_email_composer(
+                id_, _mail_ctx, biz, ctx.get("draft_text") or "")
+            # 回复闭环：设置跟进时间 + 人工确认结单（同一页可达）
+            _render_deal_closure(id_, biz, ctx.get("wf"))
+        except Exception as _mce:
+            st.caption(f"邮件/跟进闭环暂不可用：{str(_mce)[:80]}")
     return
 
     # ========== ⓪ AI NEXT BEST ACTION Hero（Action-First，spec 四）==========
@@ -3014,113 +3635,9 @@ def _render_customer_workspace(ctx):
             f"<div class='s'>{len(st_blockers)} 项阻塞</div></div>"
             "</div>", unsafe_allow_html=True)
 
-    # ========== ② Pipeline（真实状态 + 点击查看阶段知识 + 推进） ==========
-    _fpos = _crm.funnel_position(biz)
-    _pipe_html = "<div class='pipe-line'>"
-    for _i, (_sn, _sk) in enumerate(_crm.FUNNEL):
-        if _fpos >= 0 and _i < _fpos:
-            _cls = "done"
-        elif _i == _fpos:
-            _cls = "cur"
-        elif _i == 6:
-            _cls = "won"
-        else:
-            _cls = ""
-        _pipe_html += (f"<span class='pchip {_cls}'>"
-                       + ("✓ " if _cls == "done" else "" if _cls != "cur" else "● ")
-                       + f"{_sn}</span>")
-        if _i < len(_crm.FUNNEL) - 1:
-            _pipe_html += "<span class='pipe-arw'>→</span>"
-    if biz == "LOST":
-        _pipe_html += "<span class='pipe-arw'>→</span><span class='pchip lost'>⚫ LOST 已丢单（可复活到谈判）</span>"
-    elif biz == "ON_HOLD":
-        _pipe_html += "<span class='pipe-arw'>→</span><span class='pchip lost'>⏸ 暂缓中</span>"
-    elif biz == "WON":
-        _pipe_html += "<span class='pipe-arw'>→</span><span class='pchip won'>🏆 已成交</span>"
-    _pipe_html += "</div>"
-
-    with st.container(border=True):
-        _pd = st.columns([1.2, 6.6])
-        with _pd[0]:
-            st.markdown("<div style='font-size:.92rem;font-weight:800'>销售漏斗 Pipeline</div>",
-                        unsafe_allow_html=True)
-        with _pd[1]:
-            st.markdown(_pipe_html, unsafe_allow_html=True)
-        # 点击阶段 → 看「进入条件 / 缺失信息 / AI建议 / 完成条件」（真实状态驱动）
-        _pipe_opts = list(_wsx.FUNNEL_CN)
-        _cur_cn = (_wsx.FUNNEL_CN[_fpos] if 0 <= _fpos < 7 else None)
-        _sel_i = st.segmented_control(
-            "查看阶段", _pipe_opts,
-            default=_cur_cn if _cur_cn else None,
-            key=f"ws_pipe_{id_}",
-            help="点击任一阶段查看：进入条件 / 当前缺失信息 / AI 建议 / 完成条件；"
-                 "可推进到目标阶段（受状态机约束）")
-        _sel_cn = _sel_i or _cur_cn
-        _sel_idx = _pipe_opts.index(_sel_cn) if _sel_cn in _pipe_opts else -1
-        if 0 <= _sel_idx < 7:
-            # 阶段知识卡（静态）
-            st.markdown(_wsx.stage_knowledge_html(_sel_idx), unsafe_allow_html=True)
-            # 缺失信息（真实 blockers / 跟进逾期，不编造）
-            _miss_parts = []
-            if st_blockers:
-                _miss_cn = "、".join(_field_cn(f) for f in st_blockers[:4])
-                _miss_parts.append(f"阻塞项 {len(st_blockers)} 项：{_miss_cn}")
-            if fu_state == "已逾期":
-                _miss_parts.append(f"跟进已逾期（原计划 {_fu_at or '—'}）")
-            elif fu_state == "今日跟进":
-                _miss_parts.append("今日到期需跟进")
-            _miss_txt = "；".join(_miss_parts) if _miss_parts else "暂无阻塞（关键信息齐全）"
-            st.markdown(
-                f"<div class='pipe-know'><div class='pk-row'>"
-                f"<span class='pk-lb gap'>缺失信息</span><span>{_h.escape(_miss_txt)}</span>"
-                "</div></div>", unsafe_allow_html=True)
-            # AI 建议下一步（复用 workflow 口径）
-            _act_txt = (act.get("label") or "等待客户反馈")
-            _act_p = (act.get("priority") or "")
-            st.markdown(
-                f"<div class='pipe-know'><div class='pk-row'>"
-                f"<span class='pk-lb ai'>AI 建议</span><span>"
-                f"<b>{_h.escape(_act_txt)}</b>"
-                + (f"（优先级 {_h.escape(_act_p)}）" if _act_p else "") + "</span></div></div>",
-                unsafe_allow_html=True)
-            # 推进动作（真实状态机：目标段映射 biz，WON 走人工结单）
-            _target = _wsx.STAGE_TARGET_BIZ[_sel_idx]
-            _allow = _target != "WON" and _wf.can_transition(biz, _target)
-            _btn_c1, _btn_c2 = st.columns([1.1, 4])
-            with _btn_c1:
-                if _sel_idx == _fpos and biz not in ("LOST", "ON_HOLD"):
-                    st.button("已在本阶段", key=f"ws_pipe_cur_{id_}",
-                              disabled=True, use_container_width=True)
-                elif _target == "WON":
-                    st.button(f"推进到「{_sel_cn}」", key=f"ws_pipe_won_{id_}",
-                              disabled=True, use_container_width=True,
-                              help="成交需人工确认：请在下方「🏁 结单」区操作")
-                elif _allow:
-                    st.button(f"推进到「{_sel_cn}」", key=f"ws_pipe_go_{id_}",
-                              use_container_width=True, type="primary",
-                              on_click=_do_set_stage, args=(id_, _target),
-                              help="写入真实销售阶段并记入 Timeline")
-                else:
-                    st.button(f"推进到「{_sel_cn}」", key=f"ws_pipe_no_{id_}",
-                              disabled=True, use_container_width=True,
-                              help="状态机不允许跳变，需按流程逐步推进")
-            with _btn_c2:
-                if _sel_idx == _fpos and biz in ("LOST", "ON_HOLD"):
-                    _extra_note = ("已丢单：可先推进到「谈判」复活" if biz == "LOST"
-                                   else "暂缓中：恢复请先推进到其它活跃阶段")
-                    st.caption(_extra_note)
-                elif not _allow and _target != "WON":
-                    st.caption(f"状态机不允许从「{biz_cn}」直接跳到「{_sel_cn}」。"
-                               "请按销售流程逐步推进（或用右下阶段下拉退到暂缓再调整）。")
-                elif _target == "WON":
-                    st.caption("成交 = 最终业务结果，必须人工确认（AI 不自动判成交）。")
-                else:
-                    st.caption("点击后将更新真实销售阶段（Current Stage 随之变化）并记录一条 Timeline。")
-            _smsg = st.session_state.get(f"stage_msg_{id_}")
-            if _smsg:
-                st.caption(_smsg)
-        else:
-            st.caption("该询盘当前不在七段主流程中（丢单/暂缓），阶段知识卡仅对活跃流程展示。")
+    # —— Pipeline（阶段知识卡 + 阶段推进）已抽为 _render_deal_pipeline ——
+    # 唯一实现在共享 Deal Detail（_render_customer_workspace）内调用，
+    # 这里不再重复实现（历史缺陷：阶段推进被留在 return 之后的废弃分支）。
 
     with st.expander("完整工作记录（Activity Timeline / Related Records）",
                      expanded=False):
@@ -3659,7 +4176,7 @@ def render_report(report: dict, text: str, id_=None):
     # —— Phase 2：Customer + Opportunity Workspace（详情 = 客户工作区）——
     if id_ is not None:
         _render_customer_workspace(dict(
-            id=id_, rk=_rk, info=info, matches=matches, lead=lead,
+            id=id_, rk=_rk, text=text, info=info, matches=matches, lead=lead,
             draft_text=draft or "", known_email=known_email, gaps=gaps,
             insight=insight, qr=_qr, r_stat=r_stat, r_score=r_score, r_cn=r_cn,
             g_letter=_g_letter, grade=grade, stt=_stt, pri_name=_pri,
@@ -3721,47 +4238,10 @@ def render_report(report: dict, text: str, id_=None):
     elif r_stat in ("READY_FOR_QUOTATION", "ready_for_quotation"):
         _why = "关键信息已齐全，可以进入报价流程"
 
-    # —— 第二十一轮：统一客户邮件上下文（意图自动判定 + 单生成管线）——
-    # 业务员不再需要在“追问 / 回复 / 跟进”之间选；系统按当前状态自动判断。
-    _mail_product = ""
-    try:
-        _mail_product = ((insight.get("product_match") or {}).get("customer_product")
-                         or info.get("product_query") or "")
-        if not _mail_product:
-            from agent.extractor import extract_customer_product
-            _mail_product = extract_customer_product(text) or ""
-    except Exception:
-        pass
-    _fu_reason = ""
-    if id_ is not None:
-        try:
-            _m_opps = [o for o in (list_opportunities() or [])
-                       if o.get("inquiry_id") == id_]
-            if _m_opps:
-                for _mt in _db_mod.list_followup_tasks(
-                        opportunity_id=_m_opps[-1]["id"]) or []:
-                    if _mt.get("fu_status") not in ("COMPLETED", "CANCELLED"):
-                        _fu_reason = _mt.get("reason") or _fu_reason
-        except Exception:
-            pass
-    _mail_ctx = dict(
-        text=text, info=info, matches=matches, gaps=gaps,
-        stored_draft=draft or "", customer_product=_mail_product,
-        seller_company=(SELLER.get("company") or ""),
-        biz=_biz_now,
-        resolved_state=(resolve_deal_state(id_).get("resolvedState") if id_ is not None else {}),
-        quotation_ready=(r_stat in ("READY_FOR_QUOTATION", "ready_for_quotation")),
-        fu_reason=_fu_reason,
-        known=[k for k, v in info.items()
-               if k in ("email", "company", "website") and v],
-        unresolved=[m.get("name", "") for m in gaps
-                    if m.get("ask_timing") == "ASK_NOW"][:5],
-        insight=insight,
-    )
-    try:
-        _mail_intent, _mail_why = _emu.determine_email_intent(_mail_ctx)
-    except Exception:
-        _mail_intent, _mail_why = _emu.REPLY_INQUIRY, "按当前状态回复客户。"
+    # —— 统一客户邮件上下文 / 编写器已抽为模块级函数（ROUND 6.9 §5）——
+    # 唯一实现在 _build_customer_mail_ctx / _render_customer_email_composer，
+    # 由共享 Deal Detail（_render_customer_workspace）调用；此处不再重复实现，
+    # 保持「同一问句只有一套生成逻辑」（第二十一轮 spec 1/4/7）。
 
     # ROUND 2 UI simplification：默认 Action View 已提供唯一 Primary CTA。
     # 旧的多按钮行动行在默认界面隐藏；下方邮件 / 报价 / 跟进工作区仍按
@@ -3810,117 +4290,14 @@ def render_report(report: dict, text: str, id_=None):
                         st.toast("报价草稿已创建并记入 Timeline")
                         st.rerun()
 
-    # —— 第二十一轮：统一客户邮件 Composer（追问/回复/报价/跟进共用一套）——
-    # 显示：邮件目的（自动判断）→ Subject → Body → 重新生成 / 编辑 / 保存草稿 /
-    # 确认发送（人工复核后手动确认，绝不自动外发）。草稿 key 沿用 draft_box_{rk}，
-    # 保存/回复闭环与既有 update_draft / _mark_replied 完全一致。
-    if id_ is not None and f"mail_seeded_{_rk}" not in st.session_state:
-        try:
-            _mres0 = _emu.generate_customer_email(_mail_ctx, intent="AUTO")
-        except Exception as _me:
-            _mres0 = {"body": draft or "", "subject": "", "issues": [str(_me)[:80]],
-                      "intent": _emu.REPLY_INQUIRY, "intent_cn": "回复客户",
-                      "reason": ""}
-        st.session_state[f"mail_subject_{_rk}"] = _mres0.get("subject") or ""
-        st.session_state[f"draft_box_{_rk}"] = _mres0.get("body") or ""
-        st.session_state[f"mail_res_{_rk}"] = _mres0
-        st.session_state[f"mail_seeded_{_rk}"] = True
-    _exp_mail = st.session_state.get(f"ui_mail_{_rk}", False)
-    with st.expander("✉️ 生成客户邮件（邮件目的自动判断 · 草稿不自动发送）",
-                     expanded=_exp_mail):
-        if id_ is None:
-            st.caption("分析保存后即可生成统一客户邮件。")
-        else:
-            _sel_codes = [c for c, _ in _emu.SELECT_OPTIONS]
-            _sel_map = dict(_emu.SELECT_OPTIONS)
-            _cur_sel = st.session_state.get(f"mail_sel_{_rk}", "AUTO")
-            if _cur_sel not in _sel_map:
-                _cur_sel = "AUTO"
-            _cA, _cB = st.columns([2.6, 1], gap="small")
-            with _cA:
-                _choice = st.selectbox(
-                    "邮件目的（默认自动判断）", _sel_codes,
-                    index=_sel_codes.index(_cur_sel),
-                    key=f"mail_sel_{_rk}",
-                    format_func=lambda c: {"AUTO": "自动（推荐）"}.get(c, _sel_map[c]),
-                    help="自动=按询盘状态/商机阶段/跟进原因判定；也可人工指定类型。")
-                if _choice == "AUTO":
-                    st.caption(f"🎯 系统判断邮件目的：{_emu.INTENT_CN.get(_mail_intent, _mail_intent)}"
-                               f"　—　{_mail_why}")
-                else:
-                    st.caption(f"已指定邮件目的：{_sel_map.get(_choice, _choice)}"
-                               "（点「重新生成」应用）")
-            with _cB:
-                _mres = st.session_state.get(f"mail_res_{_rk}") or {}
-                _m_issues = st.session_state.get(f"mail_issues_{_rk}") or _mres.get("issues") or []
-                st.caption("安全策略：无验证不承诺 · 问句 ≤3 · 不索取已知信息 · 不自动发送")
-            if st.button("🔁 重新生成（按所选邮件目的）", key=f"mail_regen_{_rk}",
-                         use_container_width=False):
-                _nres = _emu.generate_customer_email(_mail_ctx,
-                                                     intent=_choice)
-                st.session_state[f"mail_subject_{_rk}"] = _nres.get("subject") or ""
-                st.session_state[f"draft_box_{_rk}"] = _nres.get("body") or ""
-                st.session_state[f"mail_res_{_rk}"] = _nres
-                st.session_state[f"mail_issues_{_rk}"] = _nres.get("issues") or []
-                st.toast(f"已按「{_nres.get('intent_cn')}」重新生成草稿")
-                st.rerun()
-            if _m_issues:
-                st.warning("**HUMAN REVIEW REQUIRED** 邮件含未经公司知识库验证的内容，"
-                           "仅可人工复核后手动发送：\n\n"
-                           + "\n".join("- " + str(i) for i in _m_issues[:5]))
-            st.text_input("Subject", key=f"mail_subject_{_rk}")
-            st.text_area("客户邮件草稿（可编辑 · 发送前人工复核）",
-                         key=f"draft_box_{_rk}", height=200,
-                         label_visibility="collapsed")
-            _c1, _c2, _c3, _c4 = st.columns([1, 1, 1.6, 1], gap="small")
-            with _c1:
-                st.download_button("⬇️ 下载 txt",
-                                   st.session_state.get(f"draft_box_{_rk}", ""),
-                                   file_name="customer_email.txt",
-                                   key=f"mail_dl_{_rk}", use_container_width=True)
-            with _c2:
-                if st.button("💾 保存草稿", key=f"mail_save_{_rk}",
-                             use_container_width=True,
-                             help="保存修改到该询盘草稿并记入 Timeline"):
-                    _ws_save_draft(id_)
-            with _c3:
-                if _biz_now not in ("REPLIED", "FOLLOW_UP", "QUOTED", "NEGOTIATING",
-                                    "WON", "LOST", "ON_HOLD"):
-                    if st.button("📤 确认发送（人工复核后手动确认）",
-                                 key=f"mark_replied_{id_}", type="primary",
-                                 use_container_width=True,
-                                 help="只标记为已发送并推进状态，系统不会自动外发"):
-                        _mark_replied(id_)
-                        st.toast("已标记为已发送，下一步可设置跟进时间")
-                        st.rerun()
-            st.caption("ℹ️ 发送前请人工复核：本工作台从不自动发送邮件。"
-                       "「保存草稿」与「确认发送」都会写入 Timeline。")
+    # —— 统一客户邮件上下文 / 编写器已抽为模块级函数（ROUND 6.9 §5）——
+    # 唯一实现在 _build_customer_mail_ctx / _render_customer_email_composer，
+    # 由共享 Deal Detail（_render_customer_workspace）调用；此处不再重复实现，
+    # 保持「同一问句只有一套生成逻辑」（第二十一轮 spec 1/4/7）。
 
-    if id_ is not None and _biz_now in ("REPLIED", "FOLLOW_UP", "QUOTED",
-                                        "NEGOTIATING", "READY_FOR_QUOTE"):
-        with st.expander("创建跟进", expanded=st.session_state.get(f"ui_fuzone_{_rk}", False)):
-            st.selectbox("跟进时间", FU_OPTIONS, key=f"compact_fu_pick_{id_}", index=1)
-            if st.button("⏰ 设置跟进", key=f"fuset_{id_}",
-                         use_container_width=True, type="primary"):
-                st.session_state[f"fu_pick_{id_}"] = st.session_state.get(f"compact_fu_pick_{id_}")
-                _do_set_followup(id_)
-                st.rerun()
-
-    if id_ is not None and _biz_now in ("WON", "LOST"):
-        st.success("已成交，恭喜！" if _biz_now == "WON" else "已标记丢单（可在跟进中复盘原因）")
-    elif id_ is not None and _wf.can_transition(_biz_now, "WON"):
-        with st.expander("结单（成交 / 丢单 · 需人工确认）", expanded=False):
-            _deal_ok = st.checkbox("我确认这是最终业务结果", key=f"deal_ok_{id_}")
-            _dc1, _dc2 = st.columns(2)
-            with _dc1:
-                st.button("标记成交", key=f"deal_won_{id_}",
-                          use_container_width=True, disabled=not _deal_ok,
-                          on_click=_do_mark_deal, args=(id_, "WON"))
-            with _dc2:
-                st.button("标记丢单", key=f"deal_lost_{id_}",
-                          use_container_width=True, disabled=not _deal_ok,
-                          on_click=_do_mark_deal, args=(id_, "LOST"))
-
+    # —— 跟进区 / 结单区已抽为 _render_deal_closure（ROUND 6.9 §5）——
+    # 唯一实现在共享 Deal Detail（_render_customer_workspace）内调用，
+    # 这里不再重复实现（历史缺陷：回复闭环被留在 return 之后的废弃分支）。
     with st.expander("完整客户需求", expanded=False):
         kc = st.columns(len(KEY_FIELDS), gap="small")
         for (key, label), col in zip(KEY_FIELDS, kc):
@@ -3988,732 +4365,18 @@ def render_report(report: dict, text: str, id_=None):
         st.code(text.strip())
 
     return
-
-    # ============ Level 2 · 待处理（紧跟 AI 判断：先看缺什么，再看做什么） ============
-    _zone("待处理", lv=2)
-    _fkey = f"followup_{_rk}"
-    try:
-        _grp = gapcheck.group_by_level(gaps)
-        _ready, _at = gapcheck.readiness(gaps)
-    except Exception:
-        _grp, _ready, _at = {"A": [], "B": [], "C": []}, 0, 0
-
-    # 三级表达：阻塞（逐项列出，最重，红边加粗）/ 建议确认（黄边中等）/ 可选（弱化纯文字）
-    _gl = []
-    if _prelim:
-        _bl = "".join(f"<li>⚠ {_vh.escape(str(b.get('field', '')))}</li>" for b in _prelim)
-        _gl.append(
-            f"<div class='gapline blk'><div class='hd'>阻塞项 · {len(_prelim)} 项"
-            f"（确认前无法有效报价）</div><ul class='blk-list'>{_bl}</ul></div>")
-    if _grp.get("B"):
-        _bn = "、".join(m["name"] for m in _grp["B"][:3])
-        _gl.append(f"<div class='gapline sug'><span class='lb'>建议确认</span>　{_bn}"
-                   + ("等" if len(_grp["B"]) > 3 else "")
-                   + f"（共 {len(_grp['B'])} 项，可先初步报价）</div>")
-    if _grp.get("C"):
-        _cn3 = "、".join(m["name"] for m in _grp["C"][:3])
-        _gl.append(f"<div class='gapline opt'><span class='lb'>可选</span>　{_cn3}"
-                   + ("等" if len(_grp["C"]) > 3 else "")
-                   + f"（共 {len(_grp['C'])} 项，边谈边补即可）</div>")
-    if _gl:
-        st.markdown("".join(_gl), unsafe_allow_html=True)
-    else:
-        st.success("✅ 关键信息齐全，没有阻塞事项，可直接报价 / 回信。")
-
-    # 关键数字一行带（参考指标：弱化为 hairline 分隔带，只汇总已有口径，不做新计算）
-    _mi = [
-        ("询盘等级", f"{_g_letter or '—'} 级", resp_t or _g_extra),
-        ("报价准备度", r_cn or "—", f"{r_score} 分" if r_score is not None else "暂未计算"),
-        ("客户质量分", str(q_score) if q_score is not None else "—", "六维判定"),
-        ("紧急度", urg_lbl, f"状态：{_stt}"),
-        ("回复时限", resp_t or "尽快", "按客户等级给出"),
-    ]
-    st.markdown(
-        "<div class='metric-strip'>" + "".join(
-            f"<div class='mi'><label>{t}</label><b>{v}</b>"
-            f"<small>{'　' + s if s else ''}</small></div>" for t, v, s in _mi)
-        + "</div>", unsafe_allow_html=True)
-
-    # 后续动作（第一条已放在顶部「下一步」，这里列第 2-5 条）
-    if len(_acts) > 1:
-        _task_lines = []
-        for _a in _acts[1:5]:
-            _an = _a.get("action_cn") or _ACN.get(_a.get("action", ""), _a.get("action", ""))
-            _fld = f"（{_a['related_field']}）" if _a.get("related_field") else ""
-            _task_lines.append(
-                f"- **{_a.get('priority', '')} {_an}**{_fld}　—　{_a.get('reason', '')}")
-        st.markdown("\n".join(_task_lines))
-
-    # 部分确认 ≠ 缺失：客户当前意向 + 销售建议（一行一条，不再单独开卡）
-    for p in (insight.get("partially_confirmed") or [])[:2]:
-        opts = " / ".join(p.get("customer_options", p.get("values", [])))
-        st.caption(f"🟡 部分确认 · {p['field']}：客户意向 {opts}"
-                   + (f"　💡 {p['sales_advice']}" if p.get("sales_advice") else ""))
-
-    # ============ 需求确认状态（第五轮第二次补丁 03） ============
-    # 严格区分三层语义：客户已提出(Customer Requirement) / 已确认(Confirmed) /
-    # 最终商业确认(Final Commercial Confirmation)。展示为五态标签，不改任何业务判定。
-    _sem = insight.get("requirement_semantics") or []
-    _hier = insight.get("product_hierarchy") or {}
-    if _sem or _hier:
-        _st_icon = {"confirmed": ("green", "✔ 已确认"),
-                    "partially_confirmed": ("amber", "◐ 部分确认"),
-                    "pending_confirmation": ("amber", "⏳ 待确认"),
-                    "unknown": ("low", "⚪ 未提供"),
-                    "not_applicable": ("low", "— 不适用")}
-
-        def _st_chip(state: str) -> str:
-            tone, txt = _st_icon.get(state, ("low", state))
-            return f"<span class='chip {tone}'>{txt}</span>"
-
-        _sem_lines = []
-        # ① 产品需求层级条：Category → Type → Model → Spec → Final Selection
-        if _hier.get("levels"):
-            _lv_bits = []
-            for _l in _hier["levels"]:
-                _nm = (_l.get("short") or _l.get("label", "")).strip()
-                _vv = (f"　<b>{_vh.escape(str(_l['value']))}</b>" if _l.get("value") else "")
-                _lv_bits.append(f"{_nm} {_st_chip(_l['state'])}{_vv}")
-            _sem_lines.append(
-                "<div class='gapline sug'><span class='lb'>产品需求层级</span>　"
-                + "　<span class='lb'>→</span>　".join(_lv_bits) + "</div>")
-        # ② 商业条件五态行（未提供的字段交给「待处理」表达，不重复堆）
-        _sem_bits = []
-        for _it in _sem:
-            _vv = (f"　<b>{_vh.escape(str(_it['value']))}</b>" if _it.get("value") else "")
-            _sem_bits.append(f"{_it['label']} {_st_chip(_it['state'])}{_vv}")
-        if _sem_bits:
-            _sem_lines.append(
-                "<div class='gapline opt'><span class='lb'>需求确认状态</span>　"
-                + "　·　".join(_sem_bits) + "</div>")
-        if _sem_lines:
-            st.markdown("".join(_sem_lines), unsafe_allow_html=True)
-            if _hier.get("note"):
-                st.caption(f"ℹ️ {_hier['note']}")
-
-    # 英文追问邮件（生成器收进折叠区：需要发追问信时才展开，平时不占屏；
-    # 「生成询问」主按钮通过 ui_fu_{_rk} 直接展开本区）
-    if gaps:
-        with st.expander("✉️ 生成英文追问邮件（选要问的内容，生成即可发）",
-                         expanded=st.session_state.get(f"ui_fu_{_rk}", False)):
-            # 邮箱已知的来源提示：没识别出来 ≠ 不知道，可能档案里 / 原文里早就有
-            if not any(g["key"] == "email" for g in gaps) and not (info.get("email") or "").strip():
-                src_email = (known_email or "").strip() or gapcheck.find_email_in_text(text)
-                if src_email:
-                    src = "客户档案（来自历史询盘渠道）" if known_email else "询盘原文 / 邮件签名"
-                    st.caption(f"📧 联系邮箱已知（{src}）：**{src_email}**，不会再向客户询问邮箱。")
-
-            n0 = 0
-            for lv in ("A", "B", "C"):
-                items = _grp[lv]
-                if not items:
-                    continue
-                meta = gapcheck.LEVEL_META[lv]
-                st.markdown(f"**{meta['icon']} {meta['title']}　·　还缺 {len(items)} 项**　·　{meta['tip']}")
-                for m in items:
-                    n0 += 1
-                    badge = "　🎯 智能追问" if m.get("smart") else ""
-                    st.write(f"**{n0}. {m['name']}**{badge}")
-                    if m.get("reason"):
-                        st.caption(f"　　↳ {m['reason']}")
-                    st.caption(f"　　💬 {m['question']}")
-
-            # 选要追问哪些等级（C 类默认不选，一次问太多会把客户问跑）
-            st.markdown("**选择要追问的内容**")
-            cA, cB, cC = st.columns(3)
-            sel_a = cA.checkbox(f"⚠️ 报价前需确认（缺 {len(_grp['A'])} 项）", value=True, key=f"selA_{_fkey}")
-            sel_b = cB.checkbox(f"📌 建议确定（缺 {len(_grp['B'])} 项）", value=True, key=f"selB_{_fkey}")
-            sel_c = cC.checkbox(f"💡 可选问题（缺 {len(_grp['C'])} 项）", value=False, key=f"selC_{_fkey}",
-                                help="参考信息，建议第二封信再问，一次问太多会把客户问跑")
-            levels = tuple(l for l, on in (("A", sel_a), ("B", sel_b), ("C", sel_c)) if on)
-
-            if levels:
-                # 邮件按"选中的等级组合"分别缓存，切换勾选会自动换草稿
-                mail_key = f"{_fkey}_{''.join(levels)}"
-                if mail_key not in st.session_state:
-                    st.session_state[mail_key] = gapcheck.build_followup_email(
-                        gaps, info, SELLER.get("company", ""), levels)
-
-                n_q = sum(1 for m in gaps if m["level"] in levels)
-                h1, h2 = st.columns([4, 1])
-                with h1:
-                    st.markdown(f"**英文追问邮件（{'/'.join(levels)} 类，共 {n_q} 问）**")
-                with h2:
-                    if st.button("✨ AI 润色", key=f"ai_fu_{mail_key}", use_container_width=True,
-                                 help="让 AI 结合这条询盘的原文，写一封更自然的追问邮件"):
-                        cl = _get_llm_client()
-                        if cl:
-                            with st.spinner("AI 正在写追问邮件…"):
-                                better = gapcheck.build_followup_email_llm(
-                                    gaps, text, info, cl, SELLER.get("company", ""), levels)
-                            if better:
-                                st.session_state[mail_key] = better
-                                st.toast("已用 AI 重写追问邮件")
-                            else:
-                                st.warning("AI 生成失败，已保留规则版草稿")
-                        else:
-                            st.warning("没检测到可用 API Key，规则版草稿即可直接用")
-
-                st.text_area("英文追问邮件草稿（可修改后直接复制发送）",
-                             key=mail_key, height=200)
-                st.download_button("⬇️ 下载追问邮件 txt",
-                                   st.session_state.get(mail_key, ""),
-                                   file_name="followup_email.txt",
-                                   key=f"dl_{mail_key}")
-            else:
-                st.caption("至少勾选一类，才会生成追问邮件。")
-
-    if id_ is not None:
-        _qk = f"ui_quote_{id_}"
-        _can_quote = bool(matches) and _biz_now not in ("WON", "LOST", "ON_HOLD")
-        with st.expander("💰 创建报价（草稿 · 不自动发送 · 确认后记入 Timeline）",
-                         expanded=bool(st.session_state.get(_qk, False))):
-            if not _can_quote:
-                st.warning("当前还不能创建报价：需先匹配产品并保持商机为活跃状态。")
-            else:
-                _qty_txt = _quantity_text(info)
-                _cur_cur = info.get("target_price_currency") or "USD"
-                _lines = []
-                for _pm in matches[:2]:
-                    _name = _pm.get("name_cn") or _pm.get("name", "")
-                    _rng = ""
-                    try:
-                        _rng = f"${_pm['price_range'][0]:.2f}–${_pm['price_range'][1]:.2f}/pc"
-                    except Exception:
-                        _rng = "价格待确认"
-                    _lines.append(f"- {_name}: {_rng}, MOQ {_pm.get('moq') or '待确认'}")
-                _default_quote = (
-                    f"Dear {info.get('contact_name') or 'Sir/Madam'},\n\n"
-                    "Thank you for your inquiry. Based on the current information, "
-                    "please find the preliminary quotation draft below:\n\n"
-                    + "\n".join(_lines)
-                    + f"\n\nQuantity: {_qty_txt}\n"
-                    + (f"Customer target price: {_cur_cur} {info.get('target_price')}\n"
-                       if info.get("target_price") else "")
-                    + "\nFinal quotation is subject to confirmed specification and trade terms.\n\n"
-                    "Best regards,\n"
-                    + (SELLER.get("company") or "")
-                )
-                with st.form(f"compact_quote_{id_}"):
-                    _quote_text = st.text_area("报价草稿（英文，发送前人工复核）",
-                                               value=_default_quote, height=180)
-                    _sub_quote = st.form_submit_button("确认创建报价（写入 Timeline）",
-                                                       type="primary")
-                    if _sub_quote:
-                        _q_summary = "、".join(str(p.get("name_cn") or p.get("name", ""))
-                                               for p in matches[:2])
-                        _record_quote_draft(id_, info, matches, _q_summary, _qty_txt)
-                        st.toast("报价草稿已创建并记入 Timeline")
-                        st.rerun()
-
-    # ============ Level 2 · 行动产出 · 回复客户（策略 → Email 预览 → 操作） ============
-    _dk = f"ui_draft_{_rk}"
-    with st.container(border=True):
-        _zone("行动产出 · 回复客户", lv=2)
-        # 第一部分：回复策略（先说清"为什么这么回"，再看邮件写得怎么样）
-        _plan = report.get("reply_plan") or {}
-        _sel_q = _plan.get("selected") or []
-        _adv2 = lead.get("advice", "") or ""
-        _st_parts = [f"**回复目的**：{_nextstep}"]
-        if _plan.get("intent"):
-            # 第五轮第三次优化：意图 → 销售阶段 → 首要动作
-            _st_parts.append(
-                f"**意图**：{_plan.get('intent_cn') or _plan.get('intent')}"
-                f"（阶段：{_plan.get('sales_stage', '')}）")
-            if _plan.get("immediate_action"):
-                _st_parts.append(f"**首要动作**：{_plan.get('immediate_action')}")
-        if r_cn:
-            _st_parts.append(f"**当前状态**：{r_cn}")
-        if _sel_q:
-            _st_parts.append(f"**追问数量**：{len(_sel_q)} 问（限流 ≤3）")
-        if _adv2:
-            _st_parts.append(f"**策略**：{_adv2}")
-        st.markdown(
-            "<div class='advice'><b>🎯 回复策略</b><br>"
-            + "　·　".join(_st_parts) + "</div>",
-            unsafe_allow_html=True)
-        # 第十一轮（spec 十四）：建议问题逐条列出（首轮最多 2-3 个，与草稿同一来源
-        # reply_plan.selected，不另造问题）；纯动作用的占位项（如"首轮禁止提问"）不显示
-        _q_show = [q for q in _sel_q
-                   if (q.get("question") or "").strip()
-                   and not (q.get("question") or "").strip().startswith("（")]
-        if _q_show:
-            _q_md = "\n".join(
-                f"**{_qi}.** {_vh.escape((q.get('tier_label') or q.get('priority') or '').strip())}　"
-                f"{_vh.escape(q['question'].strip())}"
-                for _qi, q in enumerate(_q_show[:3], 1))
-            st.markdown(
-                "<div class='advice'><b>❓ 建议问题（最多 3 个，先问卡住报价的关键项）</b><br>"
-                + _q_md.replace("\n", "<br>") + "</div>",
-                unsafe_allow_html=True)
-        # 第二部分：Email 预览（内容口径不变，仅改表述）
-        if draft:
-            _hr_flag = ("　⚠️ HUMAN REVIEW REQUIRED"
-                        if report.get("human_review_required") else "")
-            if report.get("draft_issues"):
-                # Fact Guard：邮件含未经公司知识库验证的商业承诺
-                # → 横幅放在折叠区外，不展开也必须看到；阻止自动发送
-                st.error(
-                    "**⚠️ HUMAN REVIEW REQUIRED**　邮件包含 **未经公司知识库验证的"
-                    "商业承诺**（" + str(len(report["draft_issues"])) + " 处），"
-                    "已阻止自动发送，请人工复核修改后再使用：\n\n"
-                    + "\n\n".join("- " + i for i in report["draft_issues"][:5]))
-            with st.expander("📩 Email 预览（基于本司资料生成，发送前请人工复核）"
-                             + _hr_flag,
-                             expanded=st.session_state.get(_dk, False)):
-                # 注意：key 必须按询盘隔离（draft_box_{id}）。
-                # 早期版本所有询盘共用 key="draft_box"，Streamlit 会沿用上一条询盘
-                # 残留在 session_state 里的草稿文本，造成跨询盘上下文污染。
-                st.text_area("可直接复制发送", draft, height=170,
-                             key=f"draft_box_{_rk}", label_visibility="collapsed")
-                col_d1, col_d2 = st.columns(2)
-                with col_d1:
-                    st.download_button("⬇️ 下载草稿 txt", draft, file_name="reply_draft.txt",
-                                       use_container_width=True)
-                with col_d2:
-                    if st.button("📋 复制草稿", use_container_width=True):
-                        st.toast("草稿在上方文本框：Ctrl+A 全选 → Ctrl+C 复制")
-                # Phase 2：保存草稿修改 → 写回库并记 REPLY_EDITED（生成回复必须留痕）
-                if id_ is not None:
-                    _s_c1, _s_c2 = st.columns([1.4, 3.6])
-                    with _s_c1:
-                        if st.button("💾 保存修改", key=f"ws_saved_{id_}",
-                                     use_container_width=True,
-                                     help="把上方改动保存为最新草稿，并记入 Timeline"):
-                            _ws_save_draft(id_)
-                    with _s_c2:
-                        st.caption("AI 生成的草稿可在此修改；保存后记入 Timeline（REPLY_EDITED）。")
-                # 发送后的闭环动作（第七轮 spec 七/八）：
-                # 「标记为已发送」= CRM 状态操作（REPLIED + last_replied_at + 事件），
-                # 不发送真实邮件、不伪造发送成功；发送后进入跟进流程
-                if id_ is not None and _biz_now not in (
-                        "REPLIED", "FOLLOW_UP", "QUOTED", "NEGOTIATING",
-                        "WON", "LOST", "ON_HOLD"):
-                    if st.button("📤 标记为已发送", key=f"mark_replied_{id_}",
-                                 type="primary", use_container_width=True,
-                                 help="把这条询盘标记为「已回复」，之后可设置跟进时间"):
-                        _mark_replied(id_)
-                        st.toast("已标记为已发送 ✅ 下一步：设置跟进时间")
-                        # 立即重跑：让「跟进区」和业务状态徽章马上刷新
-                        st.rerun()
-                elif id_ is not None and _wfd.get("last_replied_at"):
-                    st.caption(f"📤 已标记发送于 {_wfd['last_replied_at']}"
-                               + ("　·　回复内容以本条询盘草稿为准" if draft else ""))
-        else:
-            st.write("草稿生成失败（极少见），请重试分析。")
-
-    # ============ 行动产出 · 跟进（第七轮 spec 八/九：发送后进入跟进流程） ============
-    # 跟进 = CRM 待办，不是邮件发送；状态：待跟进 / 今日跟进 / 已逾期 / 已完成。
-    # Phase 2：整区收进可展开容器（ui_fuzone），供 Header「记录跟进」一键展开。
-    if id_ is not None and _biz_now in ("REPLIED", "FOLLOW_UP", "QUOTED",
-                                        "NEGOTIATING", "READY_FOR_QUOTE"):
-        with st.expander("⏰ 跟进（设置下次联系时间 · 所有动作记入 Timeline）",
-                         expanded=st.session_state.get(f"ui_fuzone_{_rk}", False)):
-            _fu_bits = []
-            if _wfd.get("last_replied_at"):
-                _fu_bits.append(f"上次回复 {_wfd['last_replied_at']}")
-            if _wfd.get("follow_up_at") and _fu_state != "已完成":
-                _fu_bits.append(f"计划跟进 {_wfd['follow_up_at'][:16]}")
-            if _fu_state:
-                _fu_bits.append(f"状态：{_fu_state}")
-            if _fu_bits:
-                st.markdown("<div class='advice'>" + "　·　".join(_fu_bits) + "</div>",
-                            unsafe_allow_html=True)
-            if _fu_state == "已逾期":
-                st.warning("⏰ 跟进已到期 —— 现在就该跟进这位客户了")
-            elif _fu_state == "今日跟进":
-                st.info("📅 这条询盘今天需要跟进")
-            # 设置跟进时间（到期后可反复改期；完成跟进后可再次设置新一轮）
-            if _fu_state != "已完成":
-                st.selectbox("跟进时间", FU_OPTIONS, key=f"fu_pick_{id_}", index=1,
-                             help="到期后这条询盘会进入「待跟进」，出现在 AI 今日建议里")
-                if (st.session_state.get(f"fu_pick_{id_}") == "自定义"):
-                    st.text_input("自定义时间（格式 2026-09-08 10:00）",
-                                  key=f"fu_custom_{id_}",
-                                  placeholder="2026-09-08 10:00")
-                c_f1, c_f2 = st.columns(2)
-                with c_f1:
-                    st.button("⏰ 设置跟进", key=f"fuset_{id_}",
-                              use_container_width=True, type="primary",
-                              on_click=_do_set_followup, args=(id_,))
-                with c_f2:
-                    if _wfd.get("follow_up_at"):
-                        st.button("✅ 完成本次跟进", key=f"fudone_{id_}",
-                                  use_container_width=True,
-                                  on_click=_do_complete_followup, args=(id_,))
-                _fu_msg = st.session_state.get(f"fu_msg_{id_}")
-                if _fu_msg:
-                    st.caption(_fu_msg)
-
-    # ============ 结单：成交 / 丢单（第七轮 spec 二十二/二十三：必须人工确认） ============
-    # AI 不自动标记成交；且状态机禁止 NEW/NEEDS_INFO/READY_TO_REPLY 直接跳 WON
-    if id_ is not None and _biz_now in ("WON", "LOST"):
-        st.success("🏆 已成交，恭喜！" if _biz_now == "WON" else "⚫ 已标记丢单（可在跟进中复盘原因）")
-    elif id_ is not None and _wf.can_transition(_biz_now, "WON"):
-        with st.expander("🏁 结单（成交 / 丢单 · 需人工确认）"):
-            st.caption("结单只能由人工确认，AI 判断仅供参考（spec：不把 AI 推断当业务事实）")
-            _deal_ok = st.checkbox("我确认这是最终业务结果", key=f"deal_ok_{id_}")
-            _dc1, _dc2 = st.columns(2)
-            with _dc1:
-                st.button("🏆 标记成交", key=f"deal_won_{id_}",
-                          use_container_width=True, disabled=not _deal_ok,
-                          on_click=_do_mark_deal, args=(id_, "WON"))
-            with _dc2:
-                st.button("⚫ 标记丢单", key=f"deal_lost_{id_}",
-                          use_container_width=True, disabled=not _deal_ok,
-                          on_click=_do_mark_deal, args=(id_, "LOST"))
-
-    with st.expander("完整客户需求", expanded=False):
-        kc = st.columns(len(KEY_FIELDS), gap="small")
-        for (key, label), col in zip(KEY_FIELDS, kc):
-            val = info.get(key) or ""
-            if key == "email" and not val and known_email:
-                val = known_email
-            col.markdown(
-                f"<div class='cust-chip {'ok' if val else 'miss'}'><div class='t'>{label}</div>"
-                f"<div class='v'>{_vh.escape(str(val or '未识别'))}</div></div>",
-                unsafe_allow_html=True)
-        _detail_rows = [
-            ("Product", _product_text(info, matches)),
-            ("Quantity", _quantity_text(info)),
-            ("Target Price", _price_text(info)),
-            ("Timeline", _timeline_text(info)),
-            ("Certification", info.get("certification") or "未提及"),
-            ("Customization", info.get("customization") or "未提及"),
-            ("Incoterm", info.get("incoterm") or "未提及"),
-            ("Payment", info.get("payment") or "未提及"),
-            ("Sample", info.get("sample") or "未提及"),
-        ]
-        st.markdown(
-            "<div class='metric-strip'>"
-            + "".join(f"<div class='mi'><label>{_vh.escape(k)}</label><b>{_vh.escape(str(v))}</b></div>"
-                      for k, v in _detail_rows)
-            + "</div>", unsafe_allow_html=True)
-        if matches:
-            st.markdown("**产品匹配**")
-            for p in matches[:3]:
-                st.caption(
-                    f"{p.get('name') or p.get('name_cn')} · match "
-                    f"{int(p.get('match_score', 0) * 100)}% · MOQ {p.get('moq') or '—'}")
-        else:
-            st.caption("产品库暂无匹配产品。")
-
-    with st.expander("AI 判断依据（Why?）",
-                     expanded=st.session_state.get(f"ui_basis_{_rk}", False)):
-        _render_ai_basis(lead, insight, report, _ns)
-
-    if id_ is not None:
-        with st.expander("客户资料维护 / 备注", expanded=False):
-            with st.form(f"edit_info_compact_{id_}"):
-                e1, e2 = st.columns(2)
-                n_country = e1.text_input("客户国家/地区", value=info.get("country") or "")
-                n_company = e2.text_input("客户公司", value=info.get("company") or "")
-                n_website = e1.text_input("公司网址", value=info.get("website") or "")
-                n_email = e2.text_input("联系邮箱", value=info.get("email") or "")
-                n_contact = e1.text_input("联系人", value=info.get("contact_name") or "")
-                if st.form_submit_button("保存客户信息"):
-                    update_inquiry_info(id_, {
-                        "country": n_country, "company": n_company,
-                        "website": n_website, "email": n_email,
-                        "contact_name": n_contact,
-                    })
-                    st.toast("已保存，客户档案已同步更新")
-                    st.rerun()
-            cur_note = get_inquiry_note(id_) or ""
-            note_val = st.text_area("备注", value=cur_note, height=80,
-                                    key=f"compact_note_{id_}")
-            if st.button("保存备注", key=f"compact_savenote_{id_}"):
-                update_inquiry_note(id_, note_val)
-                st.toast("备注已保存")
-
-    with st.expander("原始询盘", expanded=st.session_state.get(f"ui_src_{_rk}", False)):
-        st.code(text.strip())
-
     return
 
-    st.divider()
-
-    # ============ 第三层 · AI 分析结果（客户 → 匹配 → 评分） ============
-    _zone("AI 分析结果", lv=3)
-
-    # ① 客户关键信息（绿=已识别 / 黄=缺失可补全；档案已有邮箱会直接带出）
-    st.markdown("**① 客户关键信息**")
-    kc = st.columns(len(KEY_FIELDS), gap="small")
-    for (key, label), col in zip(KEY_FIELDS, kc):
-        val = info.get(key) or ""
-        # 邮箱：本次没识别出来，但客户档案里有（历史渠道带来的）→ 直接展示
-        from_archive = False
-        if key == "email" and not val and known_email:
-            val, from_archive = known_email, True
-        if val:
-            _mark = "<span title='来自客户档案'>📎</span>" if from_archive else "✔"
-            col.markdown(
-                f"<div class='cust-chip ok'><div class='t'>{label}</div>"
-                f"<div class='v'>{_mark} {val}</div></div>",
-                unsafe_allow_html=True)
-        else:
-            col.markdown(
-                f"<div class='cust-chip miss'><div class='t'>{label}</div>"
-                f"<div class='v'>⚠️ 未识别</div></div>",
-                unsafe_allow_html=True)
-
-    _missing_keys = [lab for k, lab in KEY_FIELDS if not info.get(k)]
-    if _missing_keys:
-        st.caption("部分字段未识别 —— 可在底部「✏️ 补全 / 修正客户信息」补全，会自动同步到客户档案。")
-
-    # 其余采购信息（四列小卡，单行看全）
-    # 多数量语义补丁：多数量时逐个标注商业语义（报价数量 2,000 pcs · 试单 500 pcs …），
-    # 不再只显示一个数字让业务员误以为客户只要这一种量
-    sems = info.get("quantity_semantics") or []
-    if len(sems) > 1:
-        qty = "　".join(f"{s['role_short']} {s['value']:,} {s.get('unit') or 'pcs'}"
-                        for s in sems[:4])
-    else:
-        qty = f"{info['quantity']:,} {info['quantity_unit']}" if info.get("quantity") else "未识别"
-    price = info.get("target_price")
-    fields = [
-        ("采购数量", qty),
-        ("目标价", f"{info.get('target_price_currency') or 'USD'} {price}" if price else "未提及"),
-        ("采购意图", info.get("intent") or "常规采购"),
-        ("紧急度", URGENCY_CN.get(info.get("urgency"), "未判断")),
-    ]
-    _fr = st.columns(4, gap="small")
-    for (k, v), _fc in zip(fields, _fr):
-        _fc.markdown(
-            f"<div class='card'><div class='t'>{k}</div>"
-            f"<div class='v' style='font-size:.9rem'>{v}</div></div>",
-            unsafe_allow_html=True)
-
-    # —— 第九轮：业务事实层（客户说的 ≠ 公司确认的 ≠ AI 推断的）——
-    # 每个关键业务字段带 Value / Source / Certainty 三元组；旧记录用当前口径实时重建
-    _facts = report.get("facts") or []
-    if not _facts:
-        try:
-            from agent.facts import build_fact_layer
-            _facts = build_fact_layer(text, info, matches, insight)
-        except Exception:
-            _facts = []
-    if _facts:
-        try:
-            from agent.facts import quote_readiness_of
-            _qr9 = quote_readiness_of(insight)
-        except Exception:
-            _qr9 = None
-        _badge = {
-            "Confirmed": ("var(--success)", "已确认"), "Explicit": ("var(--brand-500)", "客户明确"),
-            "Approximate": ("var(--warning)", "约数"), "Preferred": ("var(--brand-500)", "客户期望"),
-            "Unconfirmed": ("var(--text-muted)", "待客户确认"), "Unknown": ("var(--text-disabled)", "未提供"),
-            "Missing": ("var(--danger)", "缺失"),
-        }
-        import html as _fh
-        _rows = []
-        for _f in _facts:
-            _color, _ccn = _badge.get(_f["certainty"], ("var(--text-disabled)", _f["certainty"]))
-            # Fact Source 四源归一（本轮）：Product Data / Company Data 同属
-            # COMPANY_FACT（公司知识库）；AI Inference / Unknown 不得当公司事实
-            _src = str(_f["source"])
-            _fsrc = ("CUSTOMER_FACT" if _src == "Customer Fact"
-                     else "COMPANY_FACT" if _src in ("Company Data", "Product Data")
-                     else "SYSTEM_RULE" if _src == "系统判定"
-                     else "AI_INFERENCE" if _src == "AI Inference" else "UNKNOWN")
-            _note = (f"<div class='fnote'>{_fh.escape(str(_f['note']))}</div>"
-                     if _f.get("note") else "")
-            _rows.append(
-                "<div class='frow'>"
-                f"<div class='flab'>{_fh.escape(str(_f['label']))}</div>"
-                f"<div class='fval'>{_fh.escape(str(_f['display']))}</div>"
-                f"<div class='fsrc' title='{_fsrc}'>{_fh.escape(_src)}"
-                f"<br><span style='font-size:.58rem;opacity:.75'>{_fsrc}</span></div>"
-                f"<div class='fcert' style='color:{_color};border-color:{_color}'>{_ccn}</div>"
-                f"</div>{_note}")
-        if _qr9:
-            _rows.append(
-                "<div class='frow'>"
-                "<div class='flab'>报价状态</div>"
-                f"<div class='fval'>{_qr9['status_cn']} <span class='fqr'>{_qr9['status']}</span></div>"
-                "<div class='fsrc'>系统判定</div>"
-                "<div class='fcert' style='color:var(--text-secondary);border-color:var(--text-muted)'>与数据一致</div>"
-                "</div>")
-        st.markdown(
-            "<div class='factbox'><div class='ftitle'>📋 业务事实层　"
-            "<span class='fsub'>FACT SOURCE：CUSTOMER_FACT 客户说的 ｜ "
-            "COMPANY_FACT 公司/产品库 ｜ AI_INFERENCE 推断 ｜ UNKNOWN 未知</span></div>"
-            + "".join(_rows) + "</div>",
-            unsafe_allow_html=True)
-
-    # AI 摘要（Round 2）：统一展示 insight.ai_summary（规则/LLM 同源、≤1-2 行），
-    # 旧记录无该字段时回退 extractor summary；只渲染一份，杜绝双份堆叠。
-    _ai_sum = (insight.get("ai_summary") or "").strip() or \
-        (info.get("summary") or "").strip()
-    if _ai_sum:
-        # AI 摘要突出显示：放大字号 + 高亮卡片，数量/价格/认证/交期自动标红（业务员一眼抓关键）
-        import html as _html
-        import re as _re
-
-        def _hero(s: str) -> str:
-            s = _html.escape(str(s))
-            # 数量 / 交期：5000pcs、4周、14天、3个月…
-            s = _re.sub(
-                r"(\$ ?\d[\d,]*(?:\.\d+)?|USD ?\d[\d,]*(?:\.\d+)?"
-                r"|\d[\d,]*(?:\.\d+)?\s*(?:k\b|pcs|pieces|units|sets|pairs|个|件|只|套|双|周|天|日|个月))",
-                r"<span class='hl'>\1</span>", s, flags=_re.I)
-            # 认证 / 标准：CE、RoHS、FDA…（用字母数字边界，兼容中文紧邻的情况）
-            s = _re.sub(
-                r"(?<![A-Za-z0-9])(CE|RoHS|REACH|FDA|BSCI|ISO ?9001|EN ?71|SGS)"
-                r"(?![A-Za-z0-9])",
-                r"<span class='hl'>\1</span>", s)
-            return s
-
-        _conf = (f"<span class='conf'>（置信度 {info.get('confidence')}）</span>"
-                 if info.get("confidence") else "")
-        st.markdown(
-            "<div class='sum-hero'><div class='lbl'>🔍 AI 摘要 · 关键信息</div>"
-            f"<div class='txt'>{_hero(_ai_sum)}{_conf}</div></div>",
-            unsafe_allow_html=True)
-
-        # 信息密度行（Round 2）：需求完整度（客户侧）与产品匹配（供应侧）独立呈现。
-        # 客户把需求说得多清楚 ≠ 我方产品库有没有货——两者互不拉低。
-        _comp = insight.get("requirement_completeness") or {}
-        _pm = insight.get("product_match") or {}
-        if _comp.get("level") or _pm.get("status"):
-            import html as _phtml
-            _tones = {"HIGH": "var(--success)", "MEDIUM": "var(--warning)",
-                      "LOW": "var(--danger)", "MED": "var(--warning)"}
-            _pm_tone = {"MATCHED": "var(--success)", "PARTIAL": "var(--warning)",
-                        "UNRESOLVED": "var(--warning)",
-                        "INSUFFICIENT": "var(--danger)"}
-            _pills = []
-            if _comp.get("level"):
-                _c = _phtml.escape(str(_comp.get("level_cn") or _comp["level"]))
-                _c_tone = _tones.get(str(_comp.get("level")), "var(--text-secondary)")
-                _pills.append(
-                    f"<span style='border:1px solid {_c_tone};color:{_c_tone};"
-                    f"border-radius:999px;padding:1px 10px;font-size:.74rem'>"
-                    f"需求完整度 <b>{_c}</b> · {_comp.get('score', '?')}/"
-                    f"{_comp.get('total', '?')}</span>")
-            if _pm.get("status"):
-                _m = _phtml.escape(str(_pm.get("status_cn") or _pm["status"]))
-                _m_tone = _pm_tone.get(str(_pm.get("status")), "var(--text-secondary)")
-                _cust = _phtml.escape(str(_pm.get("customer_product") or ""))
-                _pills.append(
-                    f"<span style='border:1px solid {_m_tone};color:{_m_tone};"
-                    f"border-radius:999px;padding:1px 10px;font-size:.74rem'>"
-                    f"产品匹配 <b>{_m}</b>{(' · '+_cust[:24]) if _cust else ''}</span>")
-            st.markdown(
-                "<div style='display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 0'>"
-                + "".join(_pills) + "</div>"
-                "<div style='font-size:.72rem;color:var(--text-muted);margin:4px 0 2px'>"
-                "客户需求信息完整 ≠ 我方产品能匹配：两维度独立、互不拉低；"
-                "供应缺口走内部选型，不退回客户追问。</div>",
-                unsafe_allow_html=True)
-
-    # ② 产品匹配（八要素展示）
-    st.markdown("**② 产品匹配（命中 / 依据 / 待确认）**")
-    if matches:
-        for p in matches[:3]:
-            with st.expander(
-                    f"**{p['name']}**（{p['name_cn']}）　匹配度 "
-                    f"{int(p['match_score'] * 100)}%　"
-                    f"${p['price_range'][0]:.2f}-{p['price_range'][1]:.2f}　MOQ {p['moq']:,}",
-                    expanded=(p is matches[0])):
-                st.write(f"**匹配依据**：{p.get('match_basis') or p.get('match_reason', '')}")
-                st.write(f"**已满足条件**：" + ("、".join(p["matched_conditions"])
-                         if p.get("matched_conditions") else "（无，仅关键词间接相关）"))
-                if p.get("unmatched_conditions"):
-                    st.write(f"**未满足 / 待确认**：\n\n" +
-                             "\n\n".join(f"　· {u}" for u in p["unmatched_conditions"]))
-                if p.get("missing_info"):
-                    st.write(f"**缺失信息**：{'；'.join(p['missing_info'])}")
-                st.write(f"**推荐理由**：{p.get('recommendation', '')}")
-                for u in p.get("uncertainty", []):
-                    st.caption(f"❓ {u}")
-    else:
-        # 第五轮第二次补丁 03：品类已明确 ≠ 无产品信息——提示转为"查库匹配候选"口径
-        _hier_lv = (insight.get("product_hierarchy") or {}).get("levels") or []
-        _cat0 = next((l for l in _hier_lv if l.get("level") == "category"), {})
-        if _cat0.get("state") == "confirmed" and _cat0.get("value"):
-            st.warning("🔍 产品库暂无该品类匹配产品。客户已明确产品类别「"
-                       + str(_cat0["value"]) + "」→ 下一步：查看产品库并匹配候选产品"
-                       "（检索该品类 / 相近品类），匹配不上再请客户提供参考型号 / 图片"
-                       "（不编造产品，也不向客户反问产品类别）。")
-        else:
-            st.warning("🔍 当前产品库没有足够证据找到匹配产品（如实提示，不编造产品）——"
-                       "建议在回复草稿中请客户提供产品图片 / 链接 / 参考型号。")
-
-    # ③ Why：只作为按需解释层，不再成为独立 AI 主模块。
-    with st.expander("为什么？",
-                     expanded=st.session_state.get(f"ui_basis_{_rk}", False)):
-        st.caption("这里仅用于复核判断依据；当前执行动作以上方「下一步」为准。")
-        # 兼容历史记录：旧报告没存八维明细 → 用当前模型重算展示
-        if "dims" not in lead or any(d.get("key") == "product_match"
-                                     for d in lead.get("dims", [])) is False:
-            try:
-                from agent.lead_score import LeadScorer
-                lead = LeadScorer().score(info, matches, text=text)
-            except Exception:
-                pass
-
-        _q3 = lead.get("customer_quality_total")
-        st.caption(f"综合评分 {lead.get('score', '—')} · {_g_letter or '—'} 级"
-                   + (f"；客户质量分 {_q3}。综合评分含产品匹配与成交概率，仅内部参考。"
-                      if _q3 is not None else ""))
-
-        _dmap = {d.get("key"): d for d in lead.get("dims", [])}
-        _qd = st.columns(4, gap="small")
-        for (k, lab), _qcol in zip(_QUICK_DIMS.items(), _qd):
-            _dd = _dmap.get(k)
-            _dv = _dd.get("score") if _dd else None
-            _qc_tone = "high" if (_dv or 0) >= 70 else ("mid" if (_dv or 0) >= 40 else "low")
-            _qcol.markdown(
-                f"<div class='chip {_qc_tone}'>{lab}　<b>{_dv if _dv is not None else '—'}</b></div>",
-                unsafe_allow_html=True)
-
-        _render_ai_basis(lead, insight, report, _ns)
-
-    # ============ 第四层 · 客户与产品详情（需要时才展开） ============
-    _zone("客户与产品", lv=4)
-
-    # （原④缺失信息逐项 + 英文追问邮件已上移到「待处理事项」；原⑤报价准备度依据
-    #    / 风险 / 一致性已收进 L3「查看 AI 分析依据」折叠区，口径不变）
-
-    # ⑥ 维护：补全 / 修正 / 备注（只对已入库的历史询盘显示，新分析入库后自动出现）
-    if id_ is not None:
-        with st.expander("✏️ 补全 / 修正客户信息（AI 没识别准的可以手改）"):
-            with st.form(f"edit_info_{id_}"):
-                e1, e2 = st.columns(2)
-                n_country = e1.text_input("客户国家/地区", value=info.get("country") or "")
-                n_company = e2.text_input("客户公司", value=info.get("company") or "")
-                n_website = e1.text_input("公司网址", value=info.get("website") or "")
-                n_email = e2.text_input("联系邮箱", value=info.get("email") or "")
-                n_contact = e1.text_input("联系人", value=info.get("contact_name") or "")
-                if st.form_submit_button("💾 保存客户信息"):
-                    update_inquiry_info(id_, {
-                        "country": n_country, "company": n_company,
-                        "website": n_website, "email": n_email,
-                        "contact_name": n_contact,
-                    })
-                    st.toast("已保存，客户档案已同步更新")
-                    st.rerun()
-
-        st.markdown("**备注**")
-        cur_note = get_inquiry_note(id_) or ""
-        note_val = st.text_area("给这条询盘加备注（如跟进状态、特殊要求）",
-                                value=cur_note, height=90, key=f"note_{id_}")
-        if st.button("💾 保存备注", key=f"savenote_{id_}"):
-            update_inquiry_note(id_, note_val)
-            st.toast("备注已保存")
-
-    # 旧「询盘进度 Timeline」折叠区已被 Phase 2 Workspace 的 Activity Timeline
-    # 取代（时间倒序 · 时间/类型/内容/执行人/结果 · 支持手动记录），此处不再重复。
-
-    # ============ 第五层 · 原始数据与元数据（默认折叠，进一步弱化） ============
-    _zone("原始数据 / 元数据", lv=5)
-
-    # 原始询盘：默认折叠（AI 分析负责理解，原文负责核对；顶部按钮可一键展开）
-    with st.expander("查看原始询盘（AI 分析负责理解，原文负责核对）",
-                     expanded=st.session_state.get(f"ui_src_{_rk}", False)):
-        st.code(text.strip())
-
+# --- ROUND 7.0 CRM V1 FINAL FREEZE（§2 清理 unreachable legacy UI）----
+# render_report 原函数尾部约 727 行（包括 Level 2 待处理 / 需求确认 / 跟进 /
+# 结单 / 客户需求 / AI 依据 / 客户资料维护 / 三套报价 UI 等）整体已不可达，
+# 上面 §1-§5 抽出的模块级 helper 完整覆盖其业务语义：
+#   · 跟进 / 结单                → _render_deal_closure()
+#   · 商机阶段推进 / 状态         → _render_deal_pipeline()
+#   · 统一客户邮件 Composer     → _render_customer_email_composer()
+#   · AI 依据                   → _render_ai_basis()
+# 报价逻辑函数（_quote_amount_from_context / _record_quote_draft）保留为模块级
+# helper 以备未来 Quote Workflow 调用；具体报价 UI 由 Quote Workflow 重新设计。
 
 # ====================== 导出 Excel ======================
 def _build_xlsx(rows, columns, sheet_name):
@@ -4736,8 +4399,8 @@ def _build_xlsx(rows, columns, sheet_name):
 # ============ 界面布局 ============
 st.set_page_config(page_title="AI外贸业务工作台", layout="wide")
 
-# —— 顶栏：产品名（置顶）+ 公司徽标 + 全局“新建分析”入口 ——
-_hh = st.columns([2.4, 1.8])
+# —— 顶栏：产品名（置顶）+ 公司徽标；全局新建入口只保留在侧栏 ——
+_hh = st.columns([3.2, 1.2])
 with _hh[0]:
     st.title("AI外贸业务工作台")
     st.caption("询盘分析 · 产品匹配 · 报价决策 · 客户跟进")
@@ -4749,8 +4412,6 @@ with _hh[1]:
         + (f"<div class='co'>{_co}</div>" if _co else "<div class='co'>我方公司资料</div>")
         + (f"<div class='st'>{_st}</div>" if _st else "")
         + "</div>", unsafe_allow_html=True)
-    if st.button("＋ 新建询盘分析", key="new_top", use_container_width=True):
-        _new_analysis()
 st.markdown(PAGE_CSS, unsafe_allow_html=True)
 
 # —— 数据准备（先算再渲染，保证 KPI / 今日优先 / 为什么现在 / 销售队列 /
@@ -4790,7 +4451,10 @@ def _deal_wv(_g):
 
 
 # 全量 Deal（历史往来也计入 conversation_count）→ KPI 副行口径
-_home_all_deals = _ui.group_deal_threads(_home_items, _stage_of)
+# ROUND 6.9 §4：分组键以商机层 Deal 身份为准（_deal_identity_map），
+# 同一客户的同一产品/数量修订不再裂成两张卡。
+_deal_of = _deal_identity_map()
+_home_all_deals = _ui.group_deal_threads(_home_items, _stage_of, _deal_of)
 _home_all_wv = [_deal_wv(_g) for _g in _home_all_deals]
 # 可执行 Deal（仍有待处理往来）→ 今日优先 / 为什么现在 / 销售工作队列
 _home_wv = [w for w in _home_all_wv if w["open_count"] > 0]
@@ -4814,8 +4478,33 @@ def _deal_sort_rank(_w):
     return 5
 
 
+def _matches_sales_work_view(work_item: dict, view_name: str) -> bool:
+    """Smart View 的唯一 Deal 级筛选口径。
+
+    首页“今日行动”与侧栏计数都消费同一 DealWorkItem；这里仅把既有业务状态
+    映射到工作视图，不排序、不重算优先级，也不创建新的队列数据。
+    """
+    items = work_item.get("items") or []
+    if view_name == "优先处理":
+        return bool(work_item.get("tier") == "P1" or work_item.get("overdue"))
+    if view_name == "待回复":
+        return any(x.get("biz") == _wf.READY_TO_REPLY for x in items)
+    if view_name == "待报价":
+        return any(x.get("biz") == _wf.READY_FOR_QUOTE for x in items)
+    if view_name == "今日跟进":
+        return bool(work_item.get("lead_fu_state") == "今日跟进" or any(
+            (x.get("action") or {}).get("type") == "FOLLOW_UP_CUSTOMER"
+            for x in items))
+    if view_name == "已逾期":
+        return bool(work_item.get("overdue") or work_item.get("lead_fu_state") == "已逾期")
+    if view_name == "新询盘":
+        return bool(str(work_item.get("stage") or "").upper() in ("", "NEW") or any(
+            x.get("biz") == _wf.NEW for x in items))
+    return True
+
+
 _home_wv.sort(key=lambda _w: (_deal_sort_rank(_w),
-                              -(_w.get("queue_score") or 0)))
+                               -(_w.get("queue_score") or 0)))
 # A4 · KPI 单位桥接（只读）：上方 KPI 按询盘/消息计数，这里给"聚合后 Deal 数"，
 #   避免出现"待回复 5 但只有 2 个可执行 Deal"的困惑。
 _deal_reply = sum(1 for _w in _home_wv
@@ -4854,7 +4543,10 @@ st.markdown(
     + "</div>",
     unsafe_allow_html=True)
 
-st.markdown("<div class='workspace-section compact'><span class='title'>销售工作队列</span><span class='note'>按 Deal 聚合，一行一个可执行对象</span></div>", unsafe_allow_html=True)
+_home_work_view = st.session_state.get("sales_inbox_filter") or "全部商机"
+_home_view_label = (f" · {_home_html.escape(_home_work_view)}"
+                    if _home_work_view != "全部商机" else "")
+st.markdown("<div class='workspace-section compact'><span class='title'>今日行动</span><span class='note'>按紧急程度与销售推进需求排序" + _home_view_label + "</span></div>", unsafe_allow_html=True)
 if st.session_state.get("home_opened_id"):
     st.info(f"已打开询盘 #{st.session_state['home_opened_id']}；详情已在下方“分析询盘”区域加载，可继续执行回复、报价或跟进。")
 with st.container(border=False):
@@ -4862,78 +4554,61 @@ with st.container(border=False):
     # 数据源）。同一个 customer + product + Deal 只渲染一行；历史 Inquiry /
     # Reply 折叠在该 Deal 的展开器里，永远不单独成行。禁止按公司名去重
     # （同客户不同产品仍是两行）。
-    _mq_wv = _home_wv[:8]
+    _mq_wv = [w for w in _home_wv if _matches_sales_work_view(w, _home_work_view)][:8]
     if not _mq_wv:
-        st.caption("暂无待处理商机 —— 今天没有必须立即处理的任务。")
+        st.caption(f"“{_home_work_view}”视图当前没有需要处理的 Deal。")
     else:
-        _MQW = [1.7, 1.5, .95, .75, 1.15, 1.4, .8]
-        _mq_lab = ["客户", "产品", "数量", "优先级", "状态", "下一步", "操作"]
-        _mq_hcols = st.columns(_MQW, gap="small")
-        for _c, _lb in zip(_mq_hcols, _mq_lab):
-            _c.markdown(f"<div style='font-size:.68rem;opacity:.62'>{_lb}</div>",
-                        unsafe_allow_html=True)
         import html as _hq
         for _w in _mq_wv:
-            _qcols = st.columns(_MQW, gap="small")
             _need = _w.get("need") or {}
             _lead = _w.get("lead") or {}
-            _q_tier = _w.get("tier") or "—"
-            _q_tcol = {"P1": "var(--danger)", "P2": "var(--warning)",
-                       "P3": "var(--text-disabled)"}.get(
-                           _q_tier, "var(--text-disabled)")
-            # 状态 = Deal 当前状态（商机阶段 + 真实跟进任务），不是历史旧消息
-            _q_badge = f"{_w.get('emoji') or '🔵'} {_w.get('badge') or '—'}"
-            _q_nba = _w.get("nba") or "查看详情"
-            _q_cnt = _w.get("conversation_count") or 0
+            _q_state = _w.get("resolvedState") or {}
+            _q_action = ((_q_state.get("nextBestAction") or {}).get("type")
+                         or _w.get("nba_type") or "SEND_REPLY")
+            _q_cta = (_q_state.get("primaryCta") or _w.get("nba")
+                      or "查看并发送客户邮件")
+            _q_opp = _opp_by_inq.get(_w.get("lead_id"))
+            try:
+                _q_prog = _pg.progression_of(_q_opp.get("id")) if _q_opp else {}
+            except Exception:
+                _q_prog = {}
+            _q_na = _q_prog.get("next_activity_status") or ""
+            _q_health = _q_prog.get("health") or ""
+            _q_action_state = _q_state.get("actionState") or ""
+            # Why now 只读取 progression / resolved state 已确定的操作信号，
+            # 不创建首页专用优先级或新的 AI 判断。
+            if _q_na == "OVERDUE":
+                _q_why = "已逾期"
+            elif _q_na == "DUE_TODAY":
+                _q_why = "今天到期"
+            elif _q_health == "AT_RISK":
+                _q_why = "存在推进风险"
+            elif _q_action_state == "WAITING_INTERNAL":
+                _q_why = "待内部处理"
+            elif str(_lead.get("biz") or "").upper() == _wf.NEW:
+                _q_why = "新询盘"
+            elif str(_lead.get("biz") or "").upper() == _wf.READY_TO_REPLY:
+                _q_why = "客户已回复"
+            else:
+                _q_why = _q_prog.get("primary_reason") or _w.get("badge") or "需要推进"
+            _q_deal = " · ".join(str(x) for x in (
+                _w.get("company") or _w.get("contact") or "未知客户",
+                _w.get("product") or "产品未标注",
+                _w.get("quantity") or "数量未标注") if x)
+            _qcols = st.columns([5.2, 1.25], gap="small")
             with _qcols[0]:
-                _q_more = (f"<div style='font-size:.7rem;opacity:.68'>"
-                           f"共 {_q_cnt} 封往来</div>" if _q_cnt > 1 else "")
                 st.markdown(
-                    f"<div style='font-weight:700;font-size:.85rem'>"
-                    f"{_hq.escape(str(_w['company'] or _w['contact'] or '未知客户'))}</div>"
-                    f"<div style='font-size:.72rem;opacity:.7'>"
-                    f"{_hq.escape(str(_w.get('contact') or ''))}"
-                    + (f" · {_ui.flag(_w.get('country'))}"
-                       f"{_hq.escape(str(_w.get('country') or ''))}"
-                       if _w.get("country") else "")
-                    + "</div>" + _q_more, unsafe_allow_html=True)
-            with _qcols[1]:
-                # A3 口径：列表只显示短名（规格进 Deal 详情，不上首页队列）
-                st.markdown(
-                    f"<div style='font-size:.78rem;font-weight:600'>"
-                    f"{_hq.escape(str(_w.get('product') or '—'))}</div>",
-                    unsafe_allow_html=True)
-            with _qcols[2]:
-                st.markdown(
-                    f"<div style='font-size:.8rem'>"
-                    f"{_hq.escape(str(_w.get('quantity') or '—'))}</div>",
-                    unsafe_allow_html=True)
-            with _qcols[3]:
-                st.markdown(
-                    f"<div style='font-weight:800;font-size:.9rem;color:{_q_tcol}'>"
-                    f"{_q_tier}</div>"
-                    f"<div style='font-size:.66rem;opacity:.55'>"
-                    f"{'优先' if _q_tier == 'P1' else ('正常' if _q_tier == 'P2' else '可延后')}"
+                    f"<div class='today-action-row'>"
+                    f"<div class='action'>{_hq.escape(str(_q_cta))}</div>"
+                    f"<div class='deal'>{_hq.escape(_q_deal)}</div>"
+                    f"<div class='why'>{_hq.escape(str(_q_why)[:72])}</div>"
                     f"</div>", unsafe_allow_html=True)
-            with _qcols[4]:
-                st.markdown(
-                    f"<div style='font-size:.76rem'>"
-                    f"{_hq.escape(_q_badge)}</div>"
-                    + (f"<div style='font-size:.64rem;opacity:.6'>"
-                       f"最近 {_ui.ago(_w.get('last_created'))}</div>"
-                       if _w.get("last_created") else ""),
-                    unsafe_allow_html=True)
-            with _qcols[5]:
-                # 每个 Deal 只有一个 Next Best Action（其余操作进 Deal Detail）
-                st.markdown(
-                    f"<div style='font-size:.78rem'>"
-                    f"{_hq.escape(_q_nba)}</div>", unsafe_allow_html=True)
-            with _qcols[6]:
-                st.button("处理", key=f"mq_open_{_w['lead_id']}",
-                          use_container_width=True,
-                          on_click=_home_select_inquiry,
-                          args=(_w["lead_id"],),
-                          help=f"打开 #{_w['lead_id']} 详情执行下一步")
+            with _qcols[1]:
+                st.button(str(_q_cta), key=f"mq_open_{_w['lead_id']}",
+                          type="primary", use_container_width=True,
+                          on_click=_home_execute_resolved_action,
+                          args=(_w["lead_id"], _q_action),
+                          help=f"执行：{_q_cta}")
             # 同一 Deal 的历史往来仍保留在详情 Timeline；首页队列不再插入
             # 大面积展开条，避免扫描列表时被历史消息打断。
 
@@ -5295,385 +4970,298 @@ def _deal_opp_of(g: dict, opp_by_inq: dict, tasks_by_opp: dict) -> dict | None:
     return _ui.representative_opp(g, opp_by_inq, tasks_by_opp)
 
 
+def _sidebar_operational_status(w: dict) -> str:
+    """侧栏卡片唯一的操作状态。
+
+    只把现有 DealWorkItem / ResolvedDealState 的状态降维为一条文字；
+    不在侧栏生成第二套健康度、评分或 AI 判断。优先显示真正影响执行顺序的
+    跟进状态，其他情况才回落到当前唯一的 Next Best Action。
+    """
+    resolved = (w or {}).get("resolvedState") or {}
+    action_state = str(resolved.get("actionState") or "")
+    follow_up = str((w or {}).get("lead_fu_state") or "")
+    if (w or {}).get("overdue") or follow_up == "已逾期":
+        return "已逾期"
+    if follow_up == "今日跟进":
+        return "今日到期"
+    if action_state == "NEEDS_CUSTOMER_INFO":
+        return "待补关键信息"
+    if follow_up == "等待客户":
+        return "等待客户"
+    if action_state == "WAITING_INTERNAL":
+        return "待内部处理"
+    if action_state == "READY_TO_REPLY":
+        return "待回复"
+    return f"下一步：{(w or {}).get('nba') or '查看 Deal'}"
+
+
 def _deal_card_html(g: dict, sel_id, opp=None, opp_tasks=None,
                     clickable: bool = True) -> str:
-    """Sidebar Deal 主卡（第 23 轮：状态完全取自统一 DealWorkItem，
-    与首页 今日优先 / 为什么现在 / 销售队列同源 —— 组件不再各自拼状态）。
+    """Sidebar Quick Deal 卡片：一张卡一个 Deal，最多三行事实。
 
-    第二十三轮 §5 信息密度：默认只显示
-      优先级/状态 > 公司 > 产品·数量 > 下一步 > 「N 条往来 · 最近时间」。
-    Bluetooth/ANC/40h/OEM 等完整规格只进 Deal Detail。
-    颜色语义：红/橙=紧迫(逾期/风险/高优)，蓝=选中(.sel)，灰=历史(子卡)。
+    Deal 身份与代表商机由 group_deal_threads / representative_opp 决定；
+    卡片只呈现公司、产品数量和一个可执行状态。评分、等级、国家、历史数量
+    与健康度解释继续保留在主工作区，不进入侧栏。
     """
     import html as _esc
     w = _ui.deal_work_item(g, opp, opp_tasks)
     lead = g.get("lead") or {}
     need = w.get("need") or {}
-    _badge_txt = f"{w.get('emoji') or '🔵'} {w.get('badge') or ''}".strip()
-    if not opp and lead.get("status") == "待处理" and w.get("wait"):
-        _badge_txt += f" · {w['wait']}"
-    _tier_html = ""
-    _tier = w.get("tier") or "—"
-    if _tier not in ("", "—"):
-        _tcol = {"P1": "var(--danger)", "P2": "var(--text-secondary)",
-                 "P3": "var(--text-disabled)"}.get(_tier, "var(--text-secondary)")
-        _tier_html = f"<span class='tier' style='color:{_tcol}'>{_tier}</span>"
     _who = _esc.escape(str(w.get("company") or w.get("contact")
                             or w.get("country") or "未知客户"))
     _ptitle = _esc.escape(str(w.get("product")
                               or need.get("intent") or "询盘主题未标注"))
     _pq = (f"{_ptitle} · {_esc.escape(str(w.get('quantity')))}"
            if w.get("quantity") else _ptitle)
-    _nba = w.get("nba") or ""
-    _next_txt = (f"<div class='r2 next'>下一步：<b>"
-                 f"{_esc.escape(str(_nba))}</b></div>" if _nba else "")
-    _meta = (f"{w['conversation_count']} 条往来 · 最近 "
-             f"{_ui.ago(w.get('last_created'))} · #{w['lead_id']}")
-    _req = (w.get("resolvedState") or {}).get("resolvedRequirement") or {}
-    if _req.get("quantityChanged") and _req.get("previousQuantity") is not None:
-        _cur = _req.get("currentQuantity")
-        _prev = _req.get("previousQuantity")
-        try:
-            _cur_txt = f"{int(_cur):,}"
-            _prev_txt = f"{int(_prev):,}"
-        except Exception:
-            _cur_txt, _prev_txt = str(_cur or ""), str(_prev or "")
-        if _cur_txt and _prev_txt:
-            _meta += f" · 由 {_prev_txt} 调整为 {_cur_txt}"
+    _status = _esc.escape(_sidebar_operational_status(w))
+    # ROUND 6.8：Quick Access 默认不显示 Deal ID、消息数、时间戳或历史摘要；
+    # 数量变更等历史信息进入 Deal Detail 的 Activity Timeline。
     _sel = (sel_id is not None and any(
         str(x.get("id")) == str(sel_id) for x in w["items"]))
     _tone = w.get("tone") or "blue"
     _cls = ("sq " + _tone + (" sel" if _sel else "")
             + (" clickable" if clickable else "") + " deal")
-    _full_time = str(lead.get("created") or "")[:16].replace('"', "'")
-    return (f"<div class='{_cls}' title='#{w['lead_id']} · {_full_time}'>"
-            f"<div class='r1'><span class='sdot'></span>{_tier_html}"
-            f"<span class='stx'>{_esc.escape(_badge_txt)}</span></div>"
+    _card_title = _esc.escape(str(w.get("company") or "Deal"))
+    return (f"<div class='{_cls}' title='{_card_title}'>"
             f"<div class='co'>{_who}</div>"
             f"<div class='r2 need'>{_pq}</div>"
-            + _next_txt +
-            f"<div class='r2 meta'>{_esc.escape(_meta)}</div></div>")
+            f"<div class='r2 next'>{_status}</div>"
+            "</div>")
 
 
-# 侧边栏：销售工作队列（Sales Work Queue —— “我现在该处理什么”）
+# 侧边栏：轻量 CRM Navigation + Deal Quick Access（ROUND 6.8）
+def _set_sidebar_view(name: str):
+    st.session_state.sales_inbox_filter = name
+    st.session_state.queue_filter = {
+        "优先处理": "高优先级", "待回复": "待回复", "待报价": "待报价",
+        "今日跟进": "待跟进", "已逾期": "待跟进", "新询盘": "全部",
+        "全部商机": "全部",
+    }.get(name, "全部")
+
+
+def _toggle_sidebar_collapse():
+    st.session_state.sidebar_collapsed = not bool(st.session_state.get("sidebar_collapsed"))
+
+
+if st.session_state.get("sidebar_collapsed"):
+    st.markdown("<style>[data-testid='stSidebar']{width:62px!important;min-width:62px!important;}</style>", unsafe_allow_html=True)
+else:
+    st.markdown("<style>[data-testid='stSidebar']{width:244px!important;min-width:244px!important;}</style>", unsafe_allow_html=True)
+
 with st.sidebar:
-    st.markdown("#### 销售工作队列")
-    _sb_c1, _sb_c2 = st.columns(2)
-    with _sb_c1:
-        if st.button("＋ 新建分析", key="new_side", use_container_width=True):
+    _collapsed = bool(st.session_state.get("sidebar_collapsed"))
+    if _collapsed:
+        st.button("›", key="side_expand", use_container_width=True,
+                  on_click=_toggle_sidebar_collapse, help="展开导航")
+        st.markdown("<div class='icon-rail-note'>CRM</div>", unsafe_allow_html=True)
+        if st.button("＋", key="rail_new", use_container_width=True, help="新建询盘"):
             _new_analysis()
-    with _sb_c2:
-        # Phase 4（spec 一）：开始处理 → 按当前 Filter+Sort+Status 生成执行队列
-        st.button("▶ 开始处理", key="exec_start_side", use_container_width=True,
-                  type="primary", on_click=_enter_actq, args=(None,),
-                  help="按当前筛选与排序生成执行队列，逐条处理、完成后自动进入下一条")
+        for _ico, _view in (("⚡", "优先处理"), ("↩", "待回复"), ("💰", "待报价"),
+                            ("📅", "今日跟进"), ("⏰", "已逾期"), ("◎", "全部商机")):
+            st.button(_ico, key=f"rail_{_view}", use_container_width=True,
+                      on_click=_set_sidebar_view, args=(_view,), help=_view)
+    else:
+        _top1, _top2 = st.columns([1, .28], gap="small")
+        with _top1:
+            st.markdown("#### CRM")
+        with _top2:
+            st.button("‹", key="side_collapse", use_container_width=True,
+                      on_click=_toggle_sidebar_collapse, help="收起侧栏")
+        if st.button("＋ 新建询盘", key="new_side", use_container_width=True):
+            _new_analysis()
 
-    # —— 队列加载（spec 二十四：失败兜底，不影响已加载的主工作区）——
-    try:
-        _all_rows = load_queue(None)
-    except Exception as _qe:
-        st.error("询盘列表加载失败")
-        st.caption(str(_qe)[:140])
-        if st.button("🔄 重新加载", key="queue_reload", use_container_width=True):
-            st.rerun()
-        _all_rows = []
+        try:
+            _all_rows = load_queue(None)
+        except Exception as _qe:
+            st.error("询盘列表加载失败")
+            st.caption(str(_qe)[:140])
+            if st.button("🔄 重新加载", key="queue_reload", use_container_width=True):
+                st.rerun()
+            _all_rows = []
 
-    # —— 队列统计行（只做小字统计，来源与筛选/建议同一口径）——
-    # Phase 1：「待回复」与 KPI/筛选同口径（biz=READY_TO_REPLY），不再用待处理总数冒充
-    _n_reply = sum(1 for x in _all_rows
-                   if x["status"] == STATUS_TODO and x.get("biz") == _wf.READY_TO_REPLY)
-    _n_miss = sum(1 for x in _all_rows
-                  if x["status"] == STATUS_TODO and x["need"].get("blockers"))
-    _n_high = sum(1 for x in _all_rows
-                  if x["status"] == STATUS_TODO and x["pri"] == PRI_HIGH)
-    # 第七轮：今日需跟进（到期/今天 + 未完成 + 未结单，与 KPI/AI建议同一口径）
-    _n_fudue = sum(1 for x in _all_rows
-                   if (x.get("action") or {}).get("type") == "FOLLOW_UP_CUSTOMER")
-    # Phase 1：待报价（已具备报价条件，与 KPI/今日任务同口径）
-    _n_quote = sum(1 for x in _all_rows
-                   if x["status"] == STATUS_TODO and x.get("biz") == _wf.READY_FOR_QUOTE)
-    # 第八轮（spec 十二）：客户数 ≠ 询盘数——同一口径的身份键统计客户数
-    _n_cust = len({_ui.customer_key(x.get("cust_id"), x["company"],
-                                    x["contact"], x["id"])
-                   for x in _all_rows})
-    # 第二十二轮：统计单位明确 —— 上一行按「条（询盘/消息）」计数，
-    # 这一行按「个（待办 Deal）」计数，避免「待回复 6 但只有 2 张卡」的困惑。
-    _all_deals = _ui.group_deal_threads(_all_rows, _stage_of)
-    _d_open = sum(1 for _g in _all_deals
-                  if any(x["status"] == STATUS_TODO for x in _g["items"]))
-    _d_reply = sum(1 for _g in _all_deals
-                   if any(x.get("biz") == _wf.READY_TO_REPLY for x in _g["items"]))
-    _d_high = sum(1 for _g in _all_deals
-                  if any(x["status"] == STATUS_TODO and x["pri"] == PRI_HIGH
-                         for x in _g["items"]))
-    _d_fu = sum(1 for _g in _all_deals
-                if any((x.get("action") or {}).get("type")
-                       == "FOLLOW_UP_CUSTOMER" for x in _g["items"]))
-    st.markdown(
-        f"<div style='font-size:.72rem;opacity:.78;margin:.18rem 0 .38rem;line-height:1.45'>"
-        f"<b>{_d_open}</b> 个待办 Deal · <b>{_d_reply}</b> 待回复 · "
-        f"<b>{_d_high}</b> 高优"
-        + (f" · <b style='color:var(--danger)'>{_d_fu}</b> 今日跟进"
-           if _d_fu else "")
-        + f"<br><span style='opacity:.68'>{_n_cust} 家客户 · {_deal_open_msg} 条消息</span>"
-        + "</div>",
-        unsafe_allow_html=True)
+        _all_deals = _ui.group_deal_threads(_all_rows, _stage_of, _deal_of)
+        # ROUND 7.2 性能：原写法在同一表达式里对每个 group 调用 _deal_opp_of
+        # 三次（选商机 → 取任务 → 再取一次兜底），每次都做一遍身份键匹配。
+        # 这里显式循环，一次求值、复用结果，语义完全等价。
+        _all_wv = []
+        for _g in _all_deals:
+            _g_opp = _deal_opp_of(_g, _opp_by_inq, _tasks_by_opp)
+            _g_tasks = ((_tasks_by_opp or {}).get(_g_opp.get("id"))
+                        if _g_opp else None)
+            _all_wv.append(_ui.deal_work_item(_g, _g_opp, _g_tasks))
+        _open_wv = [w for w in _all_wv if w.get("open_count", 0) > 0]
+        _counts = {
+            "优先处理": sum(1 for w in _open_wv if _matches_sales_work_view(w, "优先处理")),
+            "待回复": sum(1 for w in _open_wv if _matches_sales_work_view(w, "待回复")),
+            "待报价": sum(1 for w in _open_wv if _matches_sales_work_view(w, "待报价")),
+            "今日跟进": sum(1 for w in _open_wv if _matches_sales_work_view(w, "今日跟进")),
+            "已逾期": sum(1 for w in _open_wv if _matches_sales_work_view(w, "已逾期")),
+            "新询盘": sum(1 for w in _open_wv if _matches_sales_work_view(w, "新询盘")),
+            "全部商机": len(_all_deals),
+        }
+        _active_view = st.session_state.get("sales_inbox_filter") or "全部商机"
+        if _active_view not in _counts:
+            _active_view = "全部商机"
 
-    # —— 搜索：客户姓名 / 公司 / 国家 / 询盘主题 / 数量 / 询盘 ID（实时过滤）——
-    _q = (st.text_input("搜索", key="inbox_search",
-                        label_visibility="collapsed",
-                        placeholder="🔍 搜索客户、公司、产品或询盘…") or "").strip().lower()
-    if _q:
-        def _hit(x):
-            _nd = x["need"] or {}
-            hay = " ".join([
-                x["company"] or "", x["contact"] or "", x["country"] or "",
-                _nd.get("intent") or "", _nd.get("qty") or "",
-                _nd.get("product") or "", str(x["id"]),
-            ]).lower()
-            return _q in hay
-        _all_rows = [x for x in _all_rows if _hit(x)]
+        # 搜索是导航级能力，保持在 Smart Views 上方；高级条件仍留在折叠区。
+        _q = (st.text_input("搜索", key="inbox_search",
+                            label_visibility="collapsed",
+                            placeholder="🔍 客户、公司、产品或商机…") or "").strip().lower()
 
-    # —— Sales Inbox：一级只保留销售人员每天使用的视图；其余筛选仍在高级筛选中。——
-    st.markdown("<div class='inbox-nav'>优先视图</div>", unsafe_allow_html=True)
-    _inbox_sel = st.segmented_control(
-        "销售工作队列筛选", ["优先处理", "新询盘", "待回复", "待报价", "今日跟进", "已逾期", "全部"],
-        selection_mode="single", default="全部", key="sales_inbox_filter", label_visibility="collapsed") or "全部"
-    _inbox_map = {"优先处理": "高优先级", "新询盘": "全部", "待回复": "待回复",
-                  "待报价": "待报价", "今日跟进": "待跟进", "已逾期": "待跟进", "全部": "全部"}
-    _sel = _inbox_map[_inbox_sel]
-    st.session_state.queue_filter = _sel
-    # 第十轮：筛选规则抽到 _filter_rows（与 AI 行动队列共用同一口径，spec 八/十五）
-    rows = _filter_rows(_all_rows, _sel)
-    if _inbox_sel == "新询盘":
-        rows = [x for x in rows if x.get("biz") in (_wf.NEW, _wf.READY_TO_REPLY)]
-    elif _inbox_sel == "已逾期":
-        _deal_overdue_ids = {o.get("inquiry_id") for o in list_opportunities()
-                             if o.get("inquiry_id") and _crm_core.health_of(o)["status"] == "overdue"}
-        rows = [x for x in rows if x.get("fu_state") == "已逾期" or x.get("id") in _deal_overdue_ids]
+        def _view_button(label: str, icon: str):
+            _active = label == _active_view
+            _mark = "• " if _active else ""
+            # 侧栏只承担“进入哪个工作视图”。保留 0 数量入口以保证导航位置
+            # 稳定，但不把 0 当作显眼的业务提醒。
+            _count = _counts.get(label, 0)
+            _count_text = f"  {_count}" if _count else ""
+            st.button(f"{_mark}{icon} {label}{_count_text}",
+                      key=f"sv_{label}", use_container_width=True,
+                      on_click=_set_sidebar_view, args=(label,), help=f"进入{label}")
 
-    # Saved Views：默认折叠。日常 Inbox 只露出当前视图，避免侧栏像完整后台页面。
-    _eu = {"Germany", "France", "Italy", "Spain", "Netherlands", "Sweden", "Poland", "Belgium", "Denmark", "Finland", "Austria", "Portugal", "Ireland", "Europe"}
-    _sv_counts = {
-        "高价值客户": sum(1 for x in _all_rows if (x.get("aip3") or 0) >= 70 or (x.get("cust_grade") or x.get("grade")) == "A"),
-        "欧洲客户": sum(1 for x in _all_rows if str(x.get("country") or "") in _eu),
-        "Alibaba": 0,
-        "本月询盘": sum(1 for x in _all_rows if str(x.get("created") or "").startswith(datetime.date.today().strftime("%Y-%m"))),
-    }
-    with st.expander("Saved Views", expanded=False):
-        _sv_cols = st.columns(2)
-        for _i, _sv in enumerate(("高价值客户", "欧洲客户", "Alibaba", "本月询盘")):
-            with _sv_cols[_i % 2]:
-                st.button(f"{_sv} {_sv_counts[_sv]}", key=f"saved_{_sv}", use_container_width=True,
-                          disabled=(_sv == "Alibaba"), on_click=_set_saved_view, args=(_sv,),
-                          help="当前询盘数据没有来源字段，Alibaba 视图将在接入来源记录后启用" if _sv == "Alibaba" else "应用保存视图")
-    _saved = st.session_state.get("sales_saved_view")
-    if _saved == "高价值客户":
-        rows = [x for x in rows if (x.get("aip3") or 0) >= 70 or (x.get("cust_grade") or x.get("grade")) == "A"]
-    elif _saved == "欧洲客户":
-        rows = [x for x in rows if str(x.get("country") or "") in _eu]
-    elif _saved == "本月询盘":
-        rows = [x for x in rows if str(x.get("created") or "").startswith(datetime.date.today().strftime("%Y-%m"))]
+        st.markdown("<div class='crm-side-title'>工作视图</div>", unsafe_allow_html=True)
+        for _label, _icon in (("优先处理", "⚡"), ("待回复", "↩"),
+                              ("今日跟进", "📅"), ("已逾期", "⏰")):
+            _view_button(_label, _icon)
+        st.markdown("<div class='crm-side-title'>收件箱</div>", unsafe_allow_html=True)
+        _view_button("新询盘", "◎")
+        st.markdown("<div class='crm-side-title'>商机</div>", unsafe_allow_html=True)
+        _view_button("全部商机", "◇")
 
-    # —— 第十轮（spec 十五）：高级筛选（收进 expander 保持界面干净）——
-    with st.expander("高级筛选"):
-        _af1, _af2 = st.columns(2)
-        with _af1:
-            _f_qr = st.selectbox(
-                "报价准备度",
-                ["全部", "NOT_READY", "PARTIALLY_READY", "READY_FOR_QUOTE", "QUOTED"],
-                key="adv_qr")
-        with _af2:
-            _f_opp = st.selectbox(
-                "商机阶段", ["全部"] + [_crm.OPP_CN[s] for s in _crm.OPP_ORDER],
-                key="adv_opp")
-        _f_ctry = st.selectbox(
-            "国家", ["全部"] + sorted({str(x["country"]) for x in _all_rows
-                                       if x.get("country")}),
-            key="adv_ctry")
-    if _f_qr != "全部":
-        rows = [x for x in rows
-                if _ns((x.get("need") or {}).get("readiness") or "") == _f_qr]
-    if _f_opp != "全部":
-        rows = [x for x in rows
-                if _crm.OPP_CN.get(_crm.opp_stage_of_biz(x.get("biz") or ""))
-                == _f_opp]
-    if _f_ctry != "全部":
-        rows = [x for x in rows if str(x.get("country") or "") == _f_ctry]
+        with st.expander("筛选与视图", expanded=False):
+            st.caption("低频工作视图与高级筛选")
+            _view_button("待报价", "💰")
+            _eu = {"Germany", "France", "Italy", "Spain", "Netherlands", "Sweden", "Poland", "Belgium", "Denmark", "Finland", "Austria", "Portugal", "Ireland", "Europe"}
+            _sv_counts = {
+                "高价值客户": sum(1 for x in _all_rows if (x.get("aip3") or 0) >= 70 or (x.get("cust_grade") or x.get("grade")) == "A"),
+                "欧洲客户": sum(1 for x in _all_rows if str(x.get("country") or "") in _eu),
+                "Alibaba": 0,
+                "本月询盘": sum(1 for x in _all_rows if str(x.get("created") or "").startswith(datetime.date.today().strftime("%Y-%m"))),
+            }
+            _sv_cols = st.columns(2)
+            for _i, _sv in enumerate(("高价值客户", "欧洲客户", "Alibaba", "本月询盘")):
+                with _sv_cols[_i % 2]:
+                    st.button(f"{_sv} {_sv_counts[_sv]}", key=f"saved_{_sv}", use_container_width=True,
+                              disabled=(_sv == "Alibaba"), on_click=_set_saved_view, args=(_sv,),
+                              help="当前询盘数据没有来源字段，Alibaba 视图将在接入来源记录后启用" if _sv == "Alibaba" else "应用保存视图")
+            _f_qr = st.selectbox("报价准备度", ["全部", "NOT_READY", "PARTIALLY_READY", "READY_FOR_QUOTE", "QUOTED"], key="adv_qr")
+            _f_opp = st.selectbox("商机阶段", ["全部"] + [_crm.OPP_CN[s] for s in _crm.OPP_ORDER], key="adv_opp")
+            _f_ctry = st.selectbox("国家", ["全部"] + sorted({str(x["country"]) for x in _all_rows if x.get("country")}), key="adv_ctry")
+            _sort = st.selectbox("排序", ["AI 综合排序（Queue Score）", "今日待办优先", "待处理优先", "最新询盘", "最久未回复", "报价准备度", "高商机分"], key="queue_sort")
 
-    # —— 排序（Phase 3 默认「AI 综合排序」= Queue Score，spec 六）——
-    # Queue Score = AIP×0.50 + 跟进风险×0.15 + 紧迫度×0.15 + 阶段紧急度×0.20
-    # （综合 Priority / Urgency / Overdue / Last Contact / Stage，见 priority3.py）
-    # 同分时按业务紧急度（今日待办 > 高优 > 待回复 > 需设跟进 > 缺信息 > 普通 > 已完成）
-    def _day_rank(x):
-        _a = (x.get("action") or {}).get("type") or ""
-        if _a == "FOLLOW_UP_CUSTOMER":
-            return 0                                      # 今日需人工处理（到期跟进）
-        if x["status"] == STATUS_TODO and x["pri"] == PRI_HIGH:
-            return 1                                      # 高优先级
-        if x["status"] == STATUS_TODO and not (x["need"] or {}).get("blockers"):
-            return 2                                      # 待回复
-        if _a == "CREATE_FOLLOW_UP":
-            return 3                                      # 需设置跟进时间
-        if x["status"] == STATUS_TODO:
-            return 4                                      # 缺少关键业务信息
-        if x["status"] == STATUS_DONE:
-            return 6                                      # 已完成 / 已关闭
-        return 5                                          # 普通询盘
-    _qs_key = lambda x: (x.get("qs3") if x.get("qs3") is not None
-                         else -x.get("pts", 0))
-    with st.expander("排序", expanded=False):
-        _sort = st.selectbox(
-            "排序", ["AI 综合排序（Queue Score）", "今日待办优先", "待处理优先",
-                     "最新询盘", "最久未回复", "报价准备度", "高商机分"],
-            key="queue_sort",
-            label_visibility="collapsed",
-            help="默认按 AI Queue Score：AI Priority×0.5 + 跟进风险×0.15 + "
-                 "紧迫度×0.15 + 阶段紧急度×0.2 综合排队（不只看单一分数）")
-    if _sort == "最新询盘":
-        rows = sorted(rows, key=lambda x: -x["id"])
-    elif _sort == "AI 综合排序（Queue Score）":
-        rows = sorted(rows, key=lambda x: (-_qs_key(x), _day_rank(x), -x["id"]))
-    elif _sort == "今日待办优先":
-        rows = sorted(rows, key=lambda x: (_day_rank(x), -x["pts"], -x["id"]))
-    elif _sort == "待处理优先":
-        rows = sorted(rows, key=lambda x: (0 if x["status"] == STATUS_TODO else 1,
-                                           -x["id"]))
-    elif _sort == "最久未回复":
-        rows = sorted(rows, key=lambda x: (0 if x["status"] == STATUS_TODO else 1,
-                                           str(x["created"]), x["id"]))
-    elif _sort == "最久未跟进":
-        # 第十轮（spec 十五）：按"最久没有动作"排——跟进时间/回复时间/创建时间
-        # 取最早者优先；都没有的排最后（不伪造时间）
-        def _fu_key(x):
-            _w = x.get("wf") or {}
-            for _t in (_w.get("follow_up_at"), _w.get("last_replied_at"),
-                       x.get("created")):
-                if _t:
-                    return (0, str(_t))
-            return (1, "")
-        rows = sorted(rows, key=lambda x: (_fu_key(x), -x["id"]))
-    elif _sort == "报价准备度":
-        rows = sorted(rows, key=lambda x: (
-            {"quoted": 0, "ready_for_quotation": 1}.get(
-                (x["need"] or {}).get("readiness"), 2),
-            -(x["score"] or 0), -x["id"]))
-    elif _sort == "高商机分":
-        rows = sorted(rows, key=lambda x: -(x["score"] or 0))
+        _q = (st.session_state.get("inbox_search") or "").strip().lower()
+        rows = list(_all_rows)
+        if _q:
+            def _hit(x):
+                _nd = x["need"] or {}
+                hay = " ".join([x["company"] or "", x["contact"] or "", x["country"] or "",
+                                _nd.get("intent") or "", _nd.get("qty") or "",
+                                _nd.get("product") or "", _nd.get("product_query") or "", str(x["id"])]).lower()
+                return _q in hay
+            rows = [x for x in rows if _hit(x)]
 
-    # —— 筛选联动（spec 六）：当前选中不在筛选结果里 → 自动选中第一条。
-    #    只切换查看对象，不重新分析、不刷新页面 ——
-    _vis_ids = [x["id"] for x in rows]
-    _cur_sel = st.session_state.get("selected_id")
-    if _cur_sel is not None and _vis_ids and _cur_sel not in _vis_ids:
-        st.session_state.selected_id = _vis_ids[0]
-        st.session_state.analyzed = None
-        _cur_sel = _vis_ids[0]
-    # 供主工作区「上一个 / 下一个」导航（跟随当前筛选与排序，spec 十九）
-    st.session_state["queue_ids"] = _vis_ids
+        _filter_map = {"优先处理": "高优先级", "待回复": "待回复", "待报价": "待报价",
+                       "今日跟进": "待跟进", "已逾期": "待跟进", "新询盘": "全部",
+                       "全部商机": "全部"}
+        _sel = _filter_map.get(_active_view, "全部")
+        st.session_state.queue_filter = _sel
+        rows = _filter_rows(rows, _sel)
+        if _active_view == "新询盘":
+            rows = [x for x in rows if x.get("biz") in (_wf.NEW, _wf.READY_TO_REPLY)]
+        elif _active_view == "已逾期":
+            _deal_overdue_ids = {o.get("inquiry_id") for o in list_opportunities()
+                                 if o.get("inquiry_id") and _crm_core.health_of(o)["status"] == "overdue"}
+            rows = [x for x in rows if x.get("fu_state") == "已逾期" or x.get("id") in _deal_overdue_ids]
 
-    # —— 队列列表：独立滚动（顶部 搜索/筛选/排序 不随列表滚动）——
-    # 第二十二轮：渲染单位从「每条 Inquiry / Message」升级为
-    # 「每个 Active Deal / Conversation Thread」—— 同一个 Deal 只允许出现
-    # 一张主卡；同客户不同产品项目仍是两张独立卡；主卡历史往来折叠、
-    # 可展开逐条打开（历史记录完整保留，不删除任何 Inquiry/Reply/Activity）。
-    # 第二十三轮：商机/跟进任务索引 _opp_by_inq/_tasks_by_opp 与首页共用
-    # （已在页面顶部统一计算），这里不再重复构建 —— Sidebar 与首页的
-    # Deal 当前状态来自同一份数据。
-    _deal_groups = _ui.group_deal_threads(rows, _stage_of)
-    _opened_extra = 0
-    for _g in _deal_groups:
-        _gkenc = repr(_g["key"])
-        if _gkenc in st.session_state.setdefault("sbdeal_open", set()):
-            _opened_extra += min(max(_g["count"] - 1, 0), 3)
-    _in_scroll = st.container(
-        height=min(max(len(_deal_groups) * 145 + _opened_extra * 74 + 40,
-                       150), 680),
-        border=False)
-    with _in_scroll:
-        if not rows:
-            # —— 空状态（spec 二十二）：搜索 / 筛选 / 全空 分开提示 ——
-            if _q:
-                st.markdown("**未找到匹配询盘**")
-                st.caption("试试其他客户、公司、产品或询盘关键词")
-                # 必须走 on_click 回调：回调在下一次运行前执行，可直接改 widget 值；
-                # 脚本体内直接改已实例化 widget 的 key 会报错
-                st.button("清除搜索", key="clear_search", use_container_width=True,
-                          on_click=_clear_search)
-            elif _sel != "全部":
-                st.markdown(f"**暂无符合条件的询盘**")
-                st.caption(f"当前筛选「{_sel}」下没有询盘，可切换到「全部」查看")
-            else:
-                st.markdown("**暂无询盘**")
-                st.caption("点左侧「＋ 新建分析」粘贴一条询盘开始")
-        else:
-            # —— Deal 视觉聚合（第二十二轮）：一个 Active Deal = 一张主卡。
-            #    身份键 = 客户身份 + 产品签名 + 活跃/已闭环桶（deal_thread_key），
-            #    绝不按公司名简单去重（同客户不同产品仍是两张独立卡）。
-            #    不删除/不合并/不改任何询盘记录，仅展示层聚合 ——
-            _dbg_seen = set()   # 渲染前保护：同一 deal key 只渲染一次
-            for _g in _deal_groups:
-                _gkenc = repr(_g["key"])
-                if _gkenc in _dbg_seen:
-                    continue    # 分组已保证唯一；此保护仅为防御性兜底
-                _dbg_seen.add(_gkenc)
-                _lead = _g["lead"]
-                # 选中 Deal 只负责高亮，不再自动展开历史；否则用户点击
-                #「收起历史」后会被 selected_id 立即重新展开。
-                _opened = _gkenc in st.session_state.setdefault("sbdeal_open",
-                                                               set())
-                _g_opp = _deal_opp_of(_g, _opp_by_inq, _tasks_by_opp)
-                _g_otasks = ((_tasks_by_opp or {}).get(_g_opp.get("id"))
-                             if _g_opp else None)
-                # Deal 主卡不再使用透明整卡覆盖按钮。该覆盖层在 Streamlit
-                # 嵌套容器里会挡住「收起历史」，所以这里改成显式操作按钮。
-                st.markdown(_deal_card_html(_g, _cur_sel, _g_opp, _g_otasks,
-                                            clickable=False),
+        _saved = st.session_state.get("sales_saved_view")
+        if _saved == "高价值客户":
+            rows = [x for x in rows if (x.get("aip3") or 0) >= 70 or (x.get("cust_grade") or x.get("grade")) == "A"]
+        elif _saved == "欧洲客户":
+            rows = [x for x in rows if str(x.get("country") or "") in _eu]
+        elif _saved == "本月询盘":
+            rows = [x for x in rows if str(x.get("created") or "").startswith(datetime.date.today().strftime("%Y-%m"))]
+        if 'adv_qr' in st.session_state and st.session_state.adv_qr != "全部":
+            rows = [x for x in rows if _ns((x.get("need") or {}).get("readiness") or "") == st.session_state.adv_qr]
+        if 'adv_opp' in st.session_state and st.session_state.adv_opp != "全部":
+            rows = [x for x in rows if _crm.OPP_CN.get(_crm.opp_stage_of_biz(x.get("biz") or "")) == st.session_state.adv_opp]
+        if 'adv_ctry' in st.session_state and st.session_state.adv_ctry != "全部":
+            rows = [x for x in rows if str(x.get("country") or "") == st.session_state.adv_ctry]
+
+        def _day_rank(x):
+            _a = (x.get("action") or {}).get("type") or ""
+            if _a == "FOLLOW_UP_CUSTOMER": return 0
+            if x["status"] == STATUS_TODO and x["pri"] == PRI_HIGH: return 1
+            if x["status"] == STATUS_TODO and not (x["need"] or {}).get("blockers"): return 2
+            if _a == "CREATE_FOLLOW_UP": return 3
+            if x["status"] == STATUS_TODO: return 4
+            if x["status"] == STATUS_DONE: return 6
+            return 5
+        _qs_key = lambda x: (x.get("qs3") if x.get("qs3") is not None else -x.get("pts", 0))
+        _sort = st.session_state.get("queue_sort") or "AI 综合排序（Queue Score）"
+        if _sort == "最新询盘":
+            rows = sorted(rows, key=lambda x: -x["id"])
+        elif _sort == "AI 综合排序（Queue Score）":
+            rows = sorted(rows, key=lambda x: (-_qs_key(x), _day_rank(x), -x["id"]))
+        elif _sort == "今日待办优先":
+            rows = sorted(rows, key=lambda x: (_day_rank(x), -x["pts"], -x["id"]))
+        elif _sort == "待处理优先":
+            rows = sorted(rows, key=lambda x: (0 if x["status"] == STATUS_TODO else 1, -x["id"]))
+        elif _sort == "最久未回复":
+            rows = sorted(rows, key=lambda x: (0 if x["status"] == STATUS_TODO else 1, str(x["created"]), x["id"]))
+        elif _sort == "报价准备度":
+            rows = sorted(rows, key=lambda x: ({"quoted": 0, "ready_for_quotation": 1}.get((x["need"] or {}).get("readiness"), 2), -(x["score"] or 0), -x["id"]))
+        elif _sort == "高商机分":
+            rows = sorted(rows, key=lambda x: -(x["score"] or 0))
+
+        _vis_ids = [x["id"] for x in rows]
+        _cur_sel = st.session_state.get("selected_id")
+        # 筛选只能改变当前队列的可见范围，不能改写用户已打开的 Deal。
+        # 否则从“最近访问”打开一个不属于当前 Smart View 的 Deal 时，下一次
+        # rerun 会立即被这里替换成队列首条，表现为点击无效或切换卡顿。
+        st.session_state["queue_ids"] = _vis_ids
+
+        # 左侧不是第二个销售队列。“最近访问”仅反映用户实际打开过的 Deal，
+        # 不按优先级再次复制首页的执行列表，也不受当前 Smart View 筛选影响。
+        _groups_by_inquiry_id = {}
+        for _all_group in _all_deals:
+            for _all_item in _all_group.get("items") or []:
+                _groups_by_inquiry_id[str(_all_item.get("id"))] = _all_group
+            _all_opp = _deal_opp_of(_all_group, _opp_by_inq, _tasks_by_opp)
+            if _all_opp and _all_opp.get("inquiry_id"):
+                _groups_by_inquiry_id[str(_all_opp["inquiry_id"])] = _all_group
+
+        _recent_groups = []
+        _recent_seen = set()
+        for _recent_iid in st.session_state.get("recent_opened_inquiry_ids", []):
+            _recent_group = _groups_by_inquiry_id.get(str(_recent_iid))
+            if not _recent_group:
+                continue
+            _recent_key = repr(_recent_group["key"])
+            if _recent_key not in _recent_seen:
+                _recent_seen.add(_recent_key)
+                _recent_groups.append(_recent_group)
+            if len(_recent_groups) == 3:
+                break
+
+        st.markdown("<div class='crm-side-title'>最近访问</div>", unsafe_allow_html=True)
+        _in_scroll = st.container(height=min(max(len(_recent_groups) * 96 + 12, 72), 300), border=False)
+        with _in_scroll:
+            if not _recent_groups:
+                st.markdown("<div class='quick-access-empty'>打开商机后会显示在这里</div>",
                             unsafe_allow_html=True)
-                if _g["count"] > 1:
-                    _hist = _compact_deal_history_items(
-                        _g["items"], lead_id=_lead["id"], limit=4)
-                    if _opened:
-                        _da1, _da2 = st.columns([1, 1], gap="small")
-                        with _da1:
-                            st.button("打开商机",
-                                      key=f"open_deal_{_lead['id']}",
-                                      use_container_width=True,
-                                      on_click=_home_select_inquiry,
-                                      args=(_lead["id"],),
-                                      help=f"打开 #{_lead['id']} 执行下一步")
-                        with _da2:
-                            st.button(f"▴ 收起历史（{_g['count']}）",
-                                      key=f"sd_close_{_gkenc}",
-                                      use_container_width=True,
-                                      on_click=_set_deal_open,
-                                      args=(_gkenc, False))
-                        for _h in _hist:
-                            _render_deal_history_row(_h)
-                        if _g["count"] - 1 > len(_hist):
-                            st.caption(
-                                f"共 {_g['count']} 条往来；Sidebar 已合并相同产品/数量的重复历史，"
-                                f"完整明细请到详情 Timeline 查看")
-                    else:
-                        _da1, _da2 = st.columns([1, 1], gap="small")
-                        with _da1:
-                            st.button("打开商机",
-                                      key=f"open_deal_{_lead['id']}",
-                                      use_container_width=True,
-                                      on_click=_home_select_inquiry,
-                                      args=(_lead["id"],),
-                                      help=f"打开 #{_lead['id']} 执行下一步")
-                        with _da2:
-                            st.button(f"▾ 历史 {_g['count'] - 1}",
-                                      key=f"sd_open_{_gkenc}",
-                                      use_container_width=True,
-                                      on_click=_set_deal_open,
-                                      args=(_gkenc, True))
-                else:
-                    st.button("打开", key=f"open_deal_{_lead['id']}",
-                              use_container_width=True,
-                              on_click=_home_select_inquiry, args=(_lead["id"],),
-                              help=f"打开 #{_lead['id']} 执行下一步")
+            else:
+                for _g in _recent_groups:
+                    _lead = _g["lead"]
+                    _g_opp = _deal_opp_of(_g, _opp_by_inq, _tasks_by_opp)
+                    _g_otasks = ((_tasks_by_opp or {}).get(_g_opp.get("id")) if _g_opp else None)
+                    st.markdown(_deal_card_html(_g, _cur_sel, _g_opp, _g_otasks, clickable=False),
+                                unsafe_allow_html=True)
+                    # Streamlit 的 HTML 卡片没有可靠的原生 click handler。保留一
+                    # 个可见、可键盘访问的按钮，避免透明 CSS 覆盖层在滚动容器内失效。
+                    _open_iid = ((_g_opp or {}).get("inquiry_id") or _lead["id"])
+                    st.button("查看 →", key=f"open_recent_{_open_iid}", use_container_width=True,
+                              on_click=_home_select_inquiry, args=(_open_iid,),
+                              help="打开 Deal")
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
     ["分析询盘", "跟进台", "商机", "客户档案", "产品库", "导出"])
@@ -5916,6 +5504,9 @@ with tab1:
                     st.error(f"AI 分析失败：{e}")
                     st.caption("可切换到「快速规则分析」模式离线重试，或检查 API Key / 网络后重新分析。")
 
+    if st.session_state.pop("pipeline_opened_id", None):
+        st.markdown("<div class='ok-tip'>✅ 已从 Pipeline 打开该 Deal 的共享 Deal Detail</div>",
+                    unsafe_allow_html=True)
     if st.session_state.get("analyzed"):
         st.markdown("<div class='ok-tip'>✅ 已存入历史记录 · 客户档案已自动归并</div>",
                     unsafe_allow_html=True)
@@ -5932,7 +5523,7 @@ with tab1:
                     st.rerun()
             render_report(rep, src, st.session_state.selected_id)
     else:
-        st.caption("ℹ️ 还没有打开的询盘 —— 点上方「＋ 新建询盘分析」粘贴原文开始分析，或在左侧队列里选择一条历史记录。")
+        st.caption("ℹ️ 还没有打开的询盘 —— 点击左侧「＋ 新建询盘」开始分析，或在左侧最近访问中打开一条记录。")
 
 # ---------- Tab2: 今日行动（状态 + 优先级排队） ----------
 with tab2:
@@ -5949,149 +5540,100 @@ with tab2:
             "紧迫度另按「逾期 + 客户优先级 + 原因」综合。"
         )# ---------- Tab3: 独立商机 CRM ----------
 with tab3:
-    _pipeline_ui.render_pipeline_page()
-    # 旧版 UI 仅作迁移参考，绝不能作为裸字符串表达式留在 Streamlit 执行上下文；
-    # Streamlit 的 magic 会把裸表达式直接渲染到页面。
-    _legacy_crm_ui_reference = """Legacy CRM view retained in source for migration reference; the new
-    Pipeline module above is the active UI.
-    st.subheader("商机")
-    st.caption("一条询盘会创建一个独立商机；同一客户可并行管理不同产品或项目。阶段、报价和任务均会保留历史。")
-    _opps = list_opportunities()
-    _open = [o for o in _opps if o["stage"] not in _crm_core.TERMINAL]
-    _won = [o for o in _opps if o["stage"] == "WON"]
-    _pipe = sum(float(o["amount"] or 0) * (float(o["probability"] or 0) / 100) for o in _open)
-    _om1, _om2, _om3, _om4 = st.columns(4)
-    _om1.metric("进行中", len(_open))
-    _om2.metric("预计加权金额", f"{_pipe:,.0f}" if _pipe else "—")
-    _om3.metric("赢单", len(_won))
-    _om4.metric("逾期任务", sum(1 for t in list_crm_tasks(open_only=True)
-                              if t[3] and str(t[3]) < datetime.datetime.now().strftime("%Y-%m-%d %H:%M")))
-    _stage_options = ["全部"] + [_crm_core.STAGE_CN[s] for s in _crm_core.STAGES]
-    _pick_stage = st.selectbox("按阶段筛选", _stage_options, key="crm_stage_filter")
-    _stage_by_cn = {v: k for k, v in _crm_core.STAGE_CN.items()}
-    _show_opps = _opps if _pick_stage == "全部" else [o for o in _opps if o["stage"] == _stage_by_cn[_pick_stage]]
-    if not _show_opps:
-        st.info("暂无商机。完成一条询盘分析后，系统会自动建立商机记录。")
-    for _o in _show_opps:
-        _health = _crm_core.health_of(_o)
-        _quotes = list_quotes(_o["id"])
-        _activities = _db_mod.list_deal_activity(_o["id"])
-        _fu_tasks = _db_mod.list_followup_tasks(opportunity_id=_o["id"])
-        _risks = _crm_core.deal_risks(
-            _o, _quotes, _fu_tasks, [a["type"] for a in _activities])
-        _dq = _crm_core.data_quality_score(
-            _o, _quotes, _fu_tasks, [a["type"] for a in _activities])
-        _dot = {"healthy": "🟢", "attention": "🟡", "at_risk": "🔴",
-                "overdue": "🔴", "closed": "⚪"}.get(_health["status"], "⚪")
-        _amt = f"{_o['currency']} {_o['amount']:,.0f}" if _o.get("amount") else "金额待确认"
-        _caption = f"{_dot} {_crm_core.STAGE_CN[_o['stage']]} · {_amt} · 概率 {_o['probability']}% · DQ {_dq['score']}"
-        with st.expander(f"{_o['title']}　{_caption}"):
-            _left, _mid, _right = st.columns([1.2, 1.5, 1.1])
-            with _left:
-                st.markdown("**交易概览**")
-                st.write(f"客户：{_o.get('company') or '待关联'}")
-                st.write(f"产品/需求：{_o.get('product') or '待补充'}")
-                st.write(f"负责人：{_o.get('owner') or '未分配'}")
-                st.write(f"预计成交：{_o.get('expected_close') or '未设置'}")
-                if _risks:
-                    st.warning("；".join(f"{r['message']} → {r['fix']}" for r in _risks[:3]))
-                else:
-                    st.success("商机健康：下一步已安排")
-            with _mid:
-                st.markdown("**更新商机**")
-                with st.form(f"opp_edit_{_o['id']}"):
-                    _title = st.text_input("商机名称", _o["title"])
-                    _prod = st.text_input("产品/需求", _o.get("product") or "")
-                    _amount = st.number_input("金额", min_value=0.0, value=float(_o.get("amount") or 0), step=100.0)
-                    _currency = st.selectbox("币种", ["USD", "EUR", "CNY"], index=["USD", "EUR", "CNY"].index(_o.get("currency") if _o.get("currency") in ["USD", "EUR", "CNY"] else "USD"))
-                    _owner = st.text_input("负责人", _o.get("owner") or "销售")
-                    _close = st.text_input("预计成交日", _o.get("expected_close") or "", placeholder="YYYY-MM-DD")
-                    _next = st.text_input("下一步行动", _o.get("next_action") or "")
-                    _due = st.text_input("下一步截止", _o.get("next_action_at") or "", placeholder="YYYY-MM-DD HH:MM")
-                    _lost = st.text_input("输单原因（输单前必填）", _o.get("lost_reason") or "")
-                    if st.form_submit_button("保存商机"):
-                        update_opportunity(_o["id"], {"title": _title, "product": _prod, "amount": _amount or None,
-                            "currency": _currency, "owner": _owner, "expected_close": _close, "next_action": _next,
-                            "next_action_at": _due, "lost_reason": _lost})
-                        st.rerun()
-            with _right:
-                st.markdown("**推进阶段**")
-                _target = st.selectbox("目标阶段", _crm_core.STAGES,
-                    format_func=lambda x: _crm_core.STAGE_CN[x], key=f"opp_stage_{_o['id']}")
-                _reason = st.text_input("变更说明", key=f"opp_reason_{_o['id']}")
-                if st.button("验证并推进", key=f"opp_move_{_o['id']}", type="primary"):
-                    _fresh = get_opportunity(_o["id"])
-                    _errors = _crm_core.transition_errors(
-                        _fresh["stage"], _target, _fresh,
-                        _crm_core.has_sent_quote(list_quotes(_o["id"])))
-                    if _errors:
-                        st.error("推进前请补齐：" + "、".join(_errors))
-                    else:
-                        move_opportunity_stage(_o["id"], _target, reason=_reason)
-                        st.rerun()
-                st.markdown("**报价版本**")
-                with st.form(f"quote_{_o['id']}"):
-                    _qa = st.number_input("报价金额", min_value=0.0, value=float(_o.get("amount") or 0), key=f"qa_{_o['id']}")
-                    _qv = st.text_input("有效期", key=f"qv_{_o['id']}", placeholder="YYYY-MM-DD")
-                    if st.form_submit_button("保存新报价版本"):
-                        if _qa <= 0:
-                            st.error("报价金额必须大于 0")
-                        else:
-                            create_quote(_o["id"], _qa, _o.get("currency") or "USD", _qv)
-                            st.rerun()
-                for _q in list_quotes(_o["id"])[:3]:
-                    _qc1, _qc2 = st.columns([3, 1])
-                    _qc1.caption(f"V{_q[1]} · {_q[3]} {_q[2]:,.0f} · {_q[5]} · 至 {_q[4] or '未设置'}")
-                    if _q[5] == "DRAFT" and _qc2.button("标记已发送", key=f"cust_quote_sent_{_q[0]}"):
-                        _db_mod.update_quote_status(_q[0], "SENT")
-                        st.rerun()
-            st.markdown("**任务与阶段历史**")
-            _task_c, _hist_c = st.columns(2)
-            with _task_c:
-                with st.form(f"task_{_o['id']}"):
-                    _task_title = st.text_input("新任务", placeholder="例如：确认样品寄送地址")
-                    _task_due = st.text_input("截止时间", placeholder="YYYY-MM-DD HH:MM")
-                    if st.form_submit_button("创建任务") and _task_title.strip():
-                        create_crm_task(_o["id"], _task_title.strip(), _task_due)
-                        st.rerun()
-                for _t in list_crm_tasks(_o["id"], open_only=True):
-                    _tc1, _tc2 = st.columns([5, 1])
-                    _tc1.caption(f"□ {_t[2]} · {_t[3] or '未设置截止'}")
-                    if _tc2.button("完成", key=f"task_done_{_t[0]}"):
-                        complete_crm_task(_t[0]); st.rerun()
-            with _hist_c:
-                for _h in list_stage_history(_o["id"])[:6]:
-                    _from = _crm_core.STAGE_CN.get(_h[0], "创建") if _h[0] else "创建"
-                    _to = _crm_core.STAGE_CN.get(_h[1], _h[1])
-                    st.caption(f"{_h[2]} · {_from} → {_to}" + (f" · {_h[4]}" if _h[4] else ""))
-
-    """
+    # ROUND 6.9 §1：Pipeline 只做概览；卡片点击进共享 Deal Detail。
+    # 旧版「裸字符串兜底 UI」已删除（DELETE > HIDE，见本轮报告 §1）。
+    _pipeline_ui.render_pipeline_page(open_deal=_open_deal_from_pipeline)
 # ---------- Tab4: 客户档案 ----------
 with tab4:
+    # ROUND 6.9 §3：客户档案 = CRM 记录列表，不是等级看板。
+    #   默认行只回答：公司 / 主要联系人 / 活跃商机 / 最近联系 / 下一次活动。
+    #   A/B/C/D 等级降为行尾一个次要 chip（仍可在详情里手动归档），
+    #   不再决定页面结构，也不再占据首屏 4 张 KPI 卡。
     st.subheader("客户档案（按邮箱/公司自动归并去重）")
-    # 等级筛选 + 分类计数
-    fsel = st.selectbox("按等级筛选 / 归档", ["全部", "A", "B", "C", "D"], index=0)
-    filter_grade = None if fsel == "全部" else fsel
-    allc = list_customers()
-    cnt_by = {"A": 0, "B": 0, "C": 0, "D": 0}
-    for r in allc:
-        g = r[9] or r[6]            # 手动等级 优先于 线索等级
-        if g in cnt_by:
-            cnt_by[g] += 1
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("A 级客户", cnt_by["A"])
-    m2.metric("B 级客户", cnt_by["B"])
-    m3.metric("C 级客户", cnt_by["C"])
-    m4.metric("D 级客户", cnt_by["D"])
-
-    custs = list_customers(filter_grade)
-    if not custs:
+    st.caption("一行一个客户记录：公司 · 主要联系人 · 活跃商机 · 最近联系 · 下一次活动。"
+               "客户等级只是次要属性，不影响页面结构。")
+    _cq = (st.text_input("搜索", key="cust_search", label_visibility="collapsed",
+                         placeholder="🔍 公司 / 国家 / 邮箱 / 联系人") or "").strip().lower()
+    _allc = list_customers()
+    _opps_all = list_opportunities()
+    _opps_of_cust, _cust_of_opp = {}, {}
+    for _o in _opps_all:
+        _opps_of_cust.setdefault(_o.get("customer_id"), []).append(_o)
+        _cust_of_opp[_o.get("id")] = _o.get("customer_id")
+    # ROUND 7.2 性能：_fu_of_cust 只依赖 opportunities（客户 id ↔ 商机 id）与跟进任务，
+    # 与搜索词 _cq 完全无关，却能支撑整页渲染，因此在同一进程内是可缓存的常量。
+    # 原写法每次 rerun 都全表拉一次跟进任务（cProfile: list_followup_tasks 单轮 16 次调用）。
+    # 任何写路径（新建/回复/任务/阶段）都会 bump 版本号，缓存随之失效，不会读到陈旧数据。
+    _fu_key = ("fu_of_cust", _queue_version())
+    _fu_of_cust = _FU_OF_CUST_CACHE.get(_fu_key)
+    if _fu_of_cust is None:
+        _fu_of_cust = {}
+        for _t in (_db_mod.list_followup_tasks() or []):
+            _cid_of_task = _cust_of_opp.get(_t.get("opportunity_id"))
+            if _cid_of_task is not None:
+                _fu_of_cust.setdefault(_cid_of_task, []).append(_t)
+        _FU_OF_CUST_CACHE.clear()
+        _FU_OF_CUST_CACHE[_fu_key] = _fu_of_cust
+    _pairs = [(_row, _crm_core.customer_record(_row, _opps_of_cust.get(_row[0]),
+                                               _fu_of_cust.get(_row[0])))
+              for _row in _allc]
+    if _cq:
+        _pairs = [(_r, _rec) for _r, _rec in _pairs
+                  if _cq in " ".join(str(_rec.get(_k) or "")
+                                     for _k in ("company", "country", "email", "contact")).lower()]
+    if not _pairs:
         st.caption("还没有客户。分析询盘后，系统会自动把同一个人/公司归并到一条档案。")
     else:
-        for cid, company, country, email, contact, cnt, last_grade, score, seen, \
-                grade, note, contacts_json in custs:
-            cur_grade = grade or last_grade or "未定"
-            with st.expander(f"{GRADE_COLOR.get(cur_grade, '')} {company or email or '未知客户'}　·　{cnt} 条询盘　·　最近 {seen}"):
+        st.caption(f"共 {len(_pairs)} 个客户记录")
+        _hcols = st.columns([2.5, 1.7, .85, 1.25, 1.85, .75], gap="small")
+        for _hc, _hl in zip(_hcols, ["公司", "主要联系人", "活跃商机",
+                                     "最近联系", "下一次活动", "等级"]):
+            _hc.markdown(f"<div style='font-size:.68rem;opacity:.62'>{_hl}</div>",
+                         unsafe_allow_html=True)
+        for _row, _rec in _pairs:
+            _r12 = (list(_row) + [None] * 12)[:12]
+            cid, company, country, email, contact, cnt, last_grade, score, seen, \
+                grade, note, contacts_json = _r12
+            _cols = st.columns([2.5, 1.7, .85, 1.25, 1.85, .75], gap="small")
+            with _cols[0]:
+                st.markdown(
+                    f"<div style='font-weight:700;font-size:.86rem'>"
+                    f"{_ui_flag_esc(_rec['company'])}</div>"
+                    f"<div style='font-size:.68rem;opacity:.65'>"
+                    f"{_flag(_rec['country'])}{_ui_flag_esc(_rec['country'])}"
+                    f"　{_ui_flag_esc(_rec['email'])}</div>", unsafe_allow_html=True)
+            with _cols[1]:
+                _extra = (f"<div style='font-size:.66rem;opacity:.6'>"
+                          f"共 {_rec['contact_count']} 位联系人</div>"
+                          if _rec["contact_count"] > 1 else "")
+                st.markdown(f"<div style='font-size:.8rem'>"
+                            f"{_ui_flag_esc(_rec['contact'])}</div>{_extra}",
+                            unsafe_allow_html=True)
+            with _cols[2]:
+                st.markdown(
+                    f"<div style='font-weight:800;font-size:.95rem;color:"
+                    f"{'var(--brand-500)' if _rec['active_deals'] else 'var(--text-disabled)'}'>"
+                    f"{_rec['active_deals']}</div>", unsafe_allow_html=True)
+            with _cols[3]:
+                st.markdown(f"<div style='font-size:.76rem'>"
+                            f"{str(_rec['last_contact'] or '—')[:10]}</div>",
+                            unsafe_allow_html=True)
+            with _cols[4]:
+                _na = _rec.get("next_activity")
+                if _na:
+                    st.markdown(
+                        f"<div style='font-size:.72rem;font-weight:700'>"
+                        f"{_ui_flag_esc(str(_na['due_at'])[:10] or '未设时间')}</div>"
+                        f"<div style='font-size:.66rem;opacity:.72'>"
+                        f"{_ui_flag_esc(_na['action'])[:28]}</div>", unsafe_allow_html=True)
+                else:
+                    st.markdown("<div style='font-size:.72rem;opacity:.5'>未安排</div>",
+                                unsafe_allow_html=True)
+            with _cols[5]:
+                st.markdown(f"<div style='font-size:.76rem;font-weight:750'>"
+                            f"{GRADE_COLOR.get(_rec['grade'], '')}"
+                            f"{_ui_flag_esc(_rec['grade'])}</div>", unsafe_allow_html=True)
+            with st.expander(f"客户详情 · {_rec['company']}"):
                 # —— 第十轮（spec 五）：客户视角 = 客户概览 + 当前商机 + 联系人
                 #     + 历史记录，一屏看懂"这个客户现在怎么样了" ——
                 import json as _cj
@@ -6107,6 +5649,9 @@ with tab4:
                 _cl = "、".join(str(c.get("name", "")).strip()
                                 for c in _contacts if str(c.get("name", "")).strip())
                 st.write(f"**联系人（{len(_contacts)}）**：{_cl or (contact or '—')}")
+                st.write(f"**客户等级（次要属性）**："
+                         f"{GRADE_COLOR.get(_rec['grade'], '')} {_rec['grade']}"
+                         f"　·　最新线索评级 {GRADE_COLOR.get(last_grade, '')}{last_grade} {score}分")
 
                 # 当前商机：从该客户全部询盘派生（复用 crm 纯函数，不写业务数据）
                 _c_items = [x for x in (load_queue(None) if cid else [])
@@ -6125,11 +5670,11 @@ with tab4:
                         + "</div></div>",
                         unsafe_allow_html=True)
 
-                st.write(f"**最新线索评级**：{GRADE_COLOR.get(last_grade, '')} {last_grade} {score}分")
-
-                # 手动定级（分类归档）
-                gidx = ["A", "B", "C", "D"].index(cur_grade) if cur_grade in ("A", "B", "C", "D") else 0
-                ng = st.selectbox("客户等级归档", ["A", "B", "C", "D"], index=gidx, key=f"grade_{cid}")
+                # 手动定级（分类归档）—— 次要属性，收在详情里
+                gidx = ["A", "B", "C", "D"].index(_rec["grade"]) \
+                    if _rec["grade"] in ("A", "B", "C", "D") else 0
+                ng = st.selectbox("客户等级归档", ["A", "B", "C", "D"],
+                                  index=gidx, key=f"grade_{cid}")
                 if st.button("💾 保存等级", key=f"savegrade_{cid}"):
                     update_customer_grade(cid, ng)
                     st.rerun()
